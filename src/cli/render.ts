@@ -32,6 +32,16 @@ function selectedProviders(service: ProviderId | "all"): ProviderId[] {
   return [service];
 }
 
+function formatResetDuration(seconds: number | null): string {
+  if (seconds == null || seconds <= 0) return "";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
 function renderText(report: UnifiedUsageReport, selected: ProviderId[]): string {
   const sections: string[] = [];
   const labels: Record<ProviderId, Record<string, string>> = {
@@ -61,7 +71,10 @@ function renderText(report: UnifiedUsageReport, selected: ProviderId[]): string 
     for (const key of orderedKeys) {
       const win = provider.limits[key];
       const value = typeof win.used_percent === "number" ? win.used_percent.toFixed(1) : "n/a";
-      sections.push(`- ${labels[providerId][key] ?? key}: ${value}%`);
+      const remaining = typeof win.remaining_percent === "number" ? win.remaining_percent.toFixed(1) : null;
+      const resetDur = formatResetDuration(win.reset_after_seconds);
+      const suffix = remaining != null && resetDur ? ` (${remaining}% remaining for ${resetDur})` : "";
+      sections.push(`- ${labels[providerId][key] ?? key}: ${value}%${suffix}`);
     }
 
     sections.push("");
