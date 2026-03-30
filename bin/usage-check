@@ -49,4 +49,8 @@ render_args=()
 [ "$service" != "all" ] && render_args+=("$service")
 [ "$format" = "json" ] && render_args+=("--json")
 
-CACHE_DIR="$CACHE_DIR" node "$RENDERER_JS" "${render_args[@]}"
+if [ "${#render_args[@]}" -gt 0 ]; then
+  CACHE_DIR="$CACHE_DIR" node "$RENDERER_JS" "${render_args[@]}"
+else
+  CACHE_DIR="$CACHE_DIR" node "$RENDERER_JS"
+fi
