@@ -19,7 +19,7 @@ func TestMain(m *testing.M) {
 	}
 	defer os.RemoveAll(dir)
 	binPath = filepath.Join(dir, "usage-check")
-	out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput()
+	out, err := exec.Command("go", "build", "-tags=fake", "-o", binPath, ".").CombinedOutput()
 	if err != nil {
 		os.Stderr.Write(out)
 		panic("go build failed: " + err.Error())
@@ -224,10 +224,15 @@ func TestCLI_Version(t *testing.T) {
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
 	}
-	// Tests build without ldflags so the default `dev` value should appear.
-	// goreleaser injects the real tag at release time.
-	if got := strings.TrimSpace(r.stdout); got != "dev" {
-		t.Fatalf("expected version 'dev', got %q", got)
+	// Tests build without ldflags. resolvedVersion() may return:
+	//   - "dev" when debug.ReadBuildInfo gives no useful version
+	//   - "(devel)" never (the guard filters it)
+	//   - a SemVer like "v2.1.0" when go-installed at a tag
+	//   - a pseudo-version like "v0.0.0-20260527-abc123+dirty" when built
+	//     from a working tree in a tagged module
+	// All non-empty outputs are acceptable; blank output is a regression.
+	if got := strings.TrimSpace(r.stdout); got == "" {
+		t.Fatalf("expected non-empty version, got empty")
 	}
 }
 

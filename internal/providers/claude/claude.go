@@ -16,7 +16,6 @@ import (
 const (
 	endpoint   = "https://api.anthropic.com/api/oauth/usage"
 	betaHeader = "oauth-2025-04-20"
-	userAgent  = "usage-check/v2 (+https://github.com/drogers0/llm-usage)"
 	timeout    = 10 * time.Second
 )
 
@@ -34,7 +33,7 @@ type Client struct {
 	readToken func(context.Context) (string, error)
 }
 
-func New(debug io.Writer) *Client {
+func New(debug io.Writer, userAgent string) *Client {
 	return &Client{
 		doer: &httpx.Doer{
 			Client:       &http.Client{Timeout: timeout},

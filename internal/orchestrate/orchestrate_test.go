@@ -201,6 +201,19 @@ func TestRun_UnknownRequestedIsSkipped(t *testing.T) {
 	}
 }
 
+func TestRun_DuplicateRequestedDedupes(t *testing.T) {
+	p := &stubProvider{id: "claude", results: []stubResult{{out: mkOutput(2)}}}
+	r, _ := Run(context.Background(),
+		[]string{"claude", "claude", "claude"},
+		[]providers.Provider{p}, Options{})
+	if p.calls.Load() != 1 {
+		t.Errorf("expected exactly one call, got %d", p.calls.Load())
+	}
+	if len(r.Providers) != 1 {
+		t.Errorf("expected one result, got %d", len(r.Providers))
+	}
+}
+
 func TestRun_NowInjection(t *testing.T) {
 	frozen := time.Date(2026, 5, 26, 20, 0, 0, 999_999_999, time.UTC)
 	p := &stubProvider{id: "claude", results: []stubResult{{out: mkOutput(2)}}}

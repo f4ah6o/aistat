@@ -18,7 +18,6 @@ import (
 const (
 	userEndpoint      = "https://api.github.com/user"
 	usageEndpointTmpl = "https://api.github.com/users/%s/settings/billing/premium_request/usage?year=%d&month=%d"
-	userAgent         = "usage-check/v2 (+https://github.com/drogers0/llm-usage)"
 	acceptHeader      = "application/vnd.github+json"
 	timeout           = 10 * time.Second
 	defaultQuota      = 300
@@ -56,7 +55,7 @@ type Option func(*Client)
 // closure touches shared state, the caller is responsible for synchronization.
 func WithWarn(fn func(string)) Option { return func(c *Client) { c.warn = fn } }
 
-func New(debug io.Writer, opts ...Option) *Client {
+func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	c := &Client{
 		doer: &httpx.Doer{
 			Client:       &http.Client{}, // ctx-scoped deadline replaces a per-client Timeout.
@@ -132,7 +131,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	if q, ok := planQuota[user.Plan.Name]; ok {
 		quota = q
 	} else if c.warn != nil {
-		c.warn(fmt.Sprintf("Copilot: unknown plan name %q; falling back to %d/month quota", user.Plan.Name, defaultQuota))
+		c.warn(fmt.Sprintf("copilot: unknown plan name %q; falling back to %d/month quota", user.Plan.Name, defaultQuota))
 	}
 
 	// See claude.go: this `now` and main's checked_at are computed from
@@ -146,16 +145,23 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	}
 
 	var gross float64
+	var copilotProductItems int
+	var sawPremiumSku bool
 	for _, it := range usage.UsageItems {
-		if it.Product == "Copilot" && it.Sku == "Copilot Premium Request" {
-			gross += it.GrossQuantity
+		if it.Product == "Copilot" {
+			copilotProductItems++
+			if it.Sku == "Copilot Premium Request" {
+				sawPremiumSku = true
+				gross += it.GrossQuantity
+			}
 		}
 	}
-	// Silent-degradation tripwire: if items existed but none matched the
-	// filter, GitHub probably changed the Product/Sku spelling. We still
-	// emit 0%, but a warning lets the user know the result is suspect.
-	if len(usage.UsageItems) > 0 && gross == 0 && c.warn != nil {
-		c.warn(fmt.Sprintf("Copilot: %d usageItems received but none matched product=\"Copilot\" sku=\"Copilot Premium Request\"; result may be incorrect", len(usage.UsageItems)))
+	// Silent-degradation tripwire: Copilot-product items present but no
+	// premium-request SKU ever observed → GitHub probably renamed the SKU.
+	// Keep emitting 0% (a brand-new account with no premium usage produces
+	// the same result), but warn the user that the result may be suspect.
+	if copilotProductItems > 0 && !sawPremiumSku && c.warn != nil {
+		c.warn(`copilot: Copilot-product usageItems present but none matched sku="Copilot Premium Request" — GitHub may have renamed the SKU; please file an issue at https://github.com/drogers0/llm-usage/issues`)
 	}
 	// Clamp to 100: the Limit contract uses a [0,100] convention. Overage
 	// detail lives in the API's discountQuantity/netQuantity fields but is

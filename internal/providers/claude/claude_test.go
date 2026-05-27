@@ -37,7 +37,7 @@ func newTestClient(t *testing.T, body []byte, status int, captureReq *http.Reque
 	return &Client{
 		doer: &httpx.Doer{
 			Client:       srv.Client(),
-			UserAgent:    userAgent,
+			UserAgent:    "usage-check-test/0",
 			ProviderID:   "claude",
 			ExtraHeaders: map[string]string{"Anthropic-Beta": betaHeader},
 		},
@@ -165,7 +165,7 @@ func TestFetch_NetworkErrorIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close() // shut down before any request
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: userAgent, ProviderID: "claude"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "claude"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 	}
@@ -181,7 +181,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: userAgent, ProviderID: "claude"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "claude"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 	}

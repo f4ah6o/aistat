@@ -80,6 +80,20 @@ func TestReportMarshalJSON(t *testing.T) {
 	}
 }
 
+func TestTitle(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"claude", "Claude"},
+		{"codex", "Codex"},
+		{"copilot", "Copilot"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := Title(c.in); got != c.want {
+			t.Errorf("Title(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestProviderResultOmitempty(t *testing.T) {
 	b, _ := json.Marshal(ProviderResult{})
 	if string(b) != "{}" {

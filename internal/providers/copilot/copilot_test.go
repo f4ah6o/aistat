@@ -44,7 +44,7 @@ func newRoutedClient(t *testing.T, userFixture, usageFixture []byte, userStatus,
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(nil, opts...)
+	c := New(nil, "usage-check-test/0", opts...)
 	c.doer.Client = srv.Client()
 	c.readToken = func(ctx context.Context) (string, error) { return "gho_fake", nil }
 	c.userURL = srv.URL + "/user"
@@ -125,6 +125,9 @@ func TestFetch_UnknownPlanFallsBackAndWarns(t *testing.T) {
 	if !strings.Contains(warnings[0], "future_tier") {
 		t.Errorf("warning should name unknown plan: %s", warnings[0])
 	}
+	if !strings.Contains(warnings[0], "copilot:") {
+		t.Errorf("warning should use lowercase copilot: prefix: %s", warnings[0])
+	}
 	// Fallback quota = 300; same as Pro, so used_percent should match TestFetch_GoldenFlow_Pro.
 	want := 159.4 / 300 * 100
 	if abs(out.Limits["month"].UsedPercent-want) > 0.01 {
@@ -159,8 +162,8 @@ func TestFetch_EmptyUsageItems(t *testing.T) {
 }
 
 func TestFetch_SkuMismatchTripsWarning(t *testing.T) {
-	// All items present but none match the documented Product/Sku — simulates
-	// a future GitHub rename of the SKU string.
+	// Copilot-product items present but the premium-request SKU is missing —
+	// simulates a future GitHub rename of the SKU string.
 	body := []byte(`{"usageItems":[
 		{"product":"Copilot","sku":"Copilot Premium Request (Renamed)","grossQuantity":100}
 	]}`)
@@ -175,8 +178,81 @@ func TestFetch_SkuMismatchTripsWarning(t *testing.T) {
 	if out.Limits["month"].UsedPercent != 0 {
 		t.Errorf("expected 0%% used when no items match, got %v", out.Limits["month"].UsedPercent)
 	}
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(warnings), warnings)
+	}
+	for _, want := range []string{"copilot:", "none matched", "file an issue"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning missing %q: %s", want, warnings[0])
+		}
+	}
+}
+
+func TestFetch_NonCopilotProductDoesNotWarn(t *testing.T) {
+	// Items exist but none with product=="Copilot" — the product gate must
+	// suppress the SKU-mismatch warning entirely.
+	body := []byte(`{"usageItems":[
+		{"product":"Actions","sku":"Compute","grossQuantity":1000}
+	]}`)
+	var warnings []string
+	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+		WithWarn(func(s string) { warnings = append(warnings, s) }),
+	)
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Limits["month"].UsedPercent != 0 {
+		t.Errorf("expected 0%% used, got %v", out.Limits["month"].UsedPercent)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("expected zero warnings for non-Copilot items, got: %v", warnings)
+	}
+}
+
+func TestFetch_NonPremiumCopilotItemsWarn(t *testing.T) {
+	// Cold-start scenario: a user has Copilot-product activity (chat
+	// completions, etc.) but has never made a premium request. The warn
+	// should fire because the premium SKU was never observed — matches the
+	// real "SKU renamed" signal. Documents intent.
+	body := []byte(`{"usageItems":[
+		{"product":"Copilot","sku":"Copilot Chat","grossQuantity":50}
+	]}`)
+	var warnings []string
+	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+		WithWarn(func(s string) { warnings = append(warnings, s) }),
+	)
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Limits["month"].UsedPercent != 0 {
+		t.Errorf("expected 0%% used (no premium-request SKU observed), got %v", out.Limits["month"].UsedPercent)
+	}
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "none matched") {
-		t.Errorf("expected SKU-mismatch warning, got: %v", warnings)
+		t.Errorf("expected SKU-mismatch warning for non-premium Copilot items, got: %v", warnings)
+	}
+}
+
+func TestFetch_PremiumSkuPresentWithZeroGrossDoesNotWarn(t *testing.T) {
+	// Premium SKU was observed (grossQuantity=0) — the !sawPremiumSku gate
+	// must suppress the warning even though gross=0.
+	body := []byte(`{"usageItems":[
+		{"product":"Copilot","sku":"Copilot Premium Request","grossQuantity":0}
+	]}`)
+	var warnings []string
+	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+		WithWarn(func(s string) { warnings = append(warnings, s) }),
+	)
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Limits["month"].UsedPercent != 0 {
+		t.Errorf("expected 0%% used, got %v", out.Limits["month"].UsedPercent)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("expected zero warnings when premium SKU is observed (even at 0), got: %v", warnings)
 	}
 }
 
@@ -243,7 +319,7 @@ func TestFetch_408IsTransient(t *testing.T) {
 func TestFetch_NetworkErrorIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close()
-	c := New(nil)
+	c := New(nil, "usage-check-test/0")
 	c.doer.Client = srv.Client()
 	c.userURL = srv.URL + "/user"
 	c.readToken = func(ctx context.Context) (string, error) { return "tok", nil }
@@ -258,7 +334,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 		time.Sleep(time.Second)
 	}))
 	defer srv.Close()
-	c := New(nil)
+	c := New(nil, "usage-check-test/0")
 	c.doer.Client = srv.Client()
 	c.userURL = srv.URL + "/user"
 	c.readToken = func(ctx context.Context) (string, error) { return "tok", nil }

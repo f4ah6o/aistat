@@ -11,33 +11,22 @@ import (
 	"github.com/drogers0/llm-usage/internal/providers/copilot"
 )
 
-// realProviders returns the live providers. When debug is non-nil, all three
-// providers' Doers share a single ConcurrencySafeWriter so concurrent debug
-// lines from different goroutines do not interleave mid-line on stderr.
-func realProviders(debug io.Writer) []providers.Provider {
+// realProviders constructs the live providers and returns them along with the
+// stderr writer (already wrapped in *ConcurrencySafeWriter) that main passes
+// into orchestrate.Run.Options.Debug when --debug is on. The same writer backs
+// the always-on Copilot warn channel, so Doer per-request debug, orchestrator
+// per-provider summary lines, and warn lines all serialize through one mutex.
+func realProviders(debug, stderr io.Writer) ([]providers.Provider, io.Writer) {
+	safeStderr := &httpx.ConcurrencySafeWriter{W: stderr}
 	var safeDebug io.Writer
 	if debug != nil {
-		safeDebug = &httpx.ConcurrencySafeWriter{W: debug}
+		safeDebug = safeStderr // same instance, shared mutex
 	}
-	var copilotOpts []copilot.Option
-	if safeDebug != nil {
-		copilotOpts = append(copilotOpts, copilot.WithWarn(func(s string) {
-			fmt.Fprintln(safeDebug, "[debug] copilot: "+s)
-		}))
-	}
+	ua := userAgent()
+	warn := func(s string) { fmt.Fprintln(safeStderr, "usage-check: "+s) }
 	return []providers.Provider{
-		claude.New(safeDebug),
-		codex.New(safeDebug),
-		copilot.New(safeDebug, copilotOpts...),
-	}
-}
-
-// fakeProviders returns deterministic in-process providers used by the
-// undocumented --fake flag for end-to-end CLI tests.
-func fakeProviders() []providers.Provider {
-	return []providers.Provider{
-		newFakeProvider("claude"),
-		newFakeProvider("codex"),
-		newFakeProvider("copilot"),
-	}
+		claude.New(safeDebug, ua),
+		codex.New(safeDebug, ua),
+		copilot.New(safeDebug, ua, copilot.WithWarn(warn)),
+	}, safeStderr
 }

@@ -6,13 +6,16 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/drogers0/llm-usage/internal/providers"
 )
 
 func TestLive_RealAuthAndEndpoint(t *testing.T) {
-	c := New(nil)
-	out, err := c.Fetch(context.Background())
+	c := New(nil, "usage-check-live-test/0")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := c.Fetch(ctx)
 	if err != nil {
 		if errors.Is(err, providers.ErrAuthMissing) {
 			t.Skipf("no Codex token at ~/.codex/auth.json; skipping live test: %v", err)

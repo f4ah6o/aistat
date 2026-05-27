@@ -12,8 +12,10 @@ import (
 )
 
 func TestLive_RealAuthAndEndpoint(t *testing.T) {
-	c := New(nil)
-	out, err := c.Fetch(context.Background())
+	c := New(nil, "usage-check-live-test/0")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := c.Fetch(ctx)
 	if err != nil {
 		if errors.Is(err, providers.ErrAuthMissing) {
 			t.Skipf("no GitHub token or missing user scope; skipping live test: %v", err)

@@ -43,7 +43,12 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 	var anyFailed bool
 
 	var wg sync.WaitGroup
+	seen := map[string]bool{}
 	for _, id := range requested {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
 		p, ok := byID[id]
 		if !ok {
 			continue

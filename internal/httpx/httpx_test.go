@@ -176,6 +176,9 @@ func TestGetJSON_NonJSONOnSuccess(t *testing.T) {
 	if !strings.Contains(err.Error(), srv.URL) {
 		t.Errorf("error should include the URL: %v", err)
 	}
+	if !strings.Contains(err.Error(), "<html>") {
+		t.Errorf("error should include body snippet: %v", err)
+	}
 }
 
 func TestGetJSON_DebugLogs(t *testing.T) {

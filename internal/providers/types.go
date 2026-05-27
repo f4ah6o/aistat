@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,15 @@ const iso8601Layout = "2006-01-02T15:04:05-07:00"
 // requested-set when no provider is specified, and the CLI help text all
 // derive from this slice. Treat as immutable.
 var KnownProviderIDs = []string{"claude", "codex", "copilot"}
+
+// Title returns the provider ID with its first byte upper-cased. Provider IDs
+// in this package are ASCII; do not use for arbitrary strings.
+func Title(id string) string {
+	if id == "" {
+		return ""
+	}
+	return strings.ToUpper(id[:1]) + id[1:]
+}
 
 // Provider is the contract every credential+endpoint backend implements.
 type Provider interface {

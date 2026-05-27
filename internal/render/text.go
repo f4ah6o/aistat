@@ -30,7 +30,7 @@ func Text(w io.Writer, r providers.Report, requested []string) error {
 		if !ok {
 			continue
 		}
-		title := strings.ToUpper(id[:1]) + id[1:] + " usage"
+		title := providers.Title(id) + " usage"
 		if result.Error != "" {
 			sections = append(sections, title+": "+result.Error)
 			continue

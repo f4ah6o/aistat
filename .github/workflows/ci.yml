@@ -24,5 +24,12 @@ jobs:
         uses: dominikh/staticcheck-action@v1
         with:
           version: "2024.1.1"
+      - name: staticcheck (fake build)
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "2024.1.1"
+          build-tags: "fake"
       - name: go test
-        run: go test -race ./...
+        run: |
+          go test -race ./...
+          go test -race -tags=fake ./...

@@ -17,9 +17,8 @@ const (
 	// Undocumented internal endpoint shared with the ChatGPT web app. Shape
 	// may change without notice; the limit_window_seconds assertions below
 	// act as a tripwire.
-	endpoint  = "https://chatgpt.com/backend-api/wham/usage"
-	userAgent = "usage-check/v2 (+https://github.com/drogers0/llm-usage)"
-	timeout   = 10 * time.Second
+	endpoint = "https://chatgpt.com/backend-api/wham/usage"
+	timeout  = 10 * time.Second
 
 	primaryWindowSeconds   = 18000  // 5 hours
 	secondaryWindowSeconds = 604800 // 7 days
@@ -31,7 +30,7 @@ type Client struct {
 	readToken func(context.Context) (string, error)
 }
 
-func New(debug io.Writer) *Client {
+func New(debug io.Writer, userAgent string) *Client {
 	return &Client{
 		doer: &httpx.Doer{
 			Client:     &http.Client{Timeout: timeout},

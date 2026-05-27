@@ -91,7 +91,7 @@ func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify
 	}
 	d.log(finalURL, "ok", elapsed)
 	if err := json.Unmarshal(body, dst); err != nil {
-		return fmt.Errorf("non-JSON response from %s: %w", finalURL, err)
+		return fmt.Errorf("non-JSON response from %s: %w: %s", finalURL, err, Snip(body))
 	}
 	return nil
 }
