@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 const (
@@ -21,6 +21,7 @@ const (
 	usageEndpointTmpl = "https://api.github.com/users/%s/settings/billing/premium_request/usage?year=%d&month=%d"
 	acceptHeader      = "application/vnd.github+json"
 	timeout           = 10 * time.Second
+	credTimeout       = 10 * time.Second
 )
 
 // KnownWindows is the set of window keys Copilot's Fetch emits. Documented
@@ -51,17 +52,19 @@ type Client struct {
 	usageURL  func(login string, year int, month int) string
 	warn      func(string)
 	now       func() time.Time
+	quota     map[string]int
 }
 
 // Option mutates a Client at construction time.
 type Option func(*Client)
 
-// WithWarn installs a callback the provider uses to surface non-fatal warnings
-// (e.g. unknown plan name, SKU filter mismatch). The CLI's debug decorator
-// passes a stderr writer here when --debug is set; main passes nothing otherwise.
-//
-// The callback may be invoked from the Fetch goroutine; if the caller's
-// closure touches shared state, the caller is responsible for synchronization.
+// WithWarn installs a callback for the SKU-drift tripwire only. The callback
+// is always installed in production (see cmd/aistat/registry.go), not
+// gated by --debug; the underlying tripwire condition is rare so an
+// unconditional install is fine. The unknown-plan path returns an error and
+// never invokes this callback. The callback may be invoked from the Fetch
+// goroutine; if the caller's closure touches shared state, the caller is
+// responsible for synchronization.
 func WithWarn(fn func(string)) Option { return func(c *Client) { c.warn = fn } }
 
 // WithNow overrides the clock-of-record used to compute ResetAfterSeconds
@@ -71,19 +74,20 @@ func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn }
 
 func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	c := &Client{
-		doer: &httpx.Doer{
-			Client:       &http.Client{}, // ctx-scoped deadline replaces a per-client Timeout. Redirect policy: see httpx.Doer doc.
-			UserAgent:    userAgent,
-			ProviderID:   "copilot",
-			ExtraHeaders: map[string]string{"Accept": acceptHeader},
-			Debug:        debug,
-		},
+		doer: httpx.NewDoer(
+			&http.Client{CheckRedirect: httpx.RejectSchemeDowngrade},
+			userAgent,
+			"copilot",
+			map[string]string{"Accept": acceptHeader},
+			debug,
+		),
 		readToken: cred.ReadGitHubToken,
 		userURL:   userEndpoint,
 		usageURL: func(login string, year int, month int) string {
 			return fmt.Sprintf(usageEndpointTmpl, login, year, month)
 		},
-		now: time.Now,
+		now:   time.Now,
+		quota: planQuota,
 	}
 	for _, o := range opts {
 		o(c)
@@ -138,28 +142,27 @@ func classifyCopilot(url string, status int, body []byte) error {
 }
 
 func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
-	// Single shared budget for both HTTP calls — matches the implicit 10s/provider used elsewhere.
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	token, err := c.readToken(ctx)
+	credCtx, credCancel := context.WithTimeout(ctx, credTimeout)
+	token, err := c.readToken(credCtx)
+	credCancel()
 	if err != nil {
-		if errors.Is(err, cred.ErrGitHubTokenNotFound) {
-			return providers.ProviderOutput{}, fmt.Errorf("%w: %s", providers.ErrAuthMissing, err.Error())
-		}
-		return providers.ProviderOutput{}, err
+		return providers.ProviderOutput{}, providers.ClassifyCredError(err, cred.ErrGitHubTokenNotFound)
 	}
 
+	// Each HTTP call gets its own 10s budget via GetJSON's timeout parameter
+	// (parity with Claude and Codex single-call providers).
 	var user userResp
-	if err := c.doer.GetJSON(ctx, c.userURL, token, &user, httpx.DefaultClassify); err != nil {
+	if err := c.doer.GetJSON(ctx, c.userURL, token, timeout, &user, httpx.DefaultClassify); err != nil {
 		return providers.ProviderOutput{}, err
 	}
 	if user.Login == "" {
 		return providers.ProviderOutput{}, errors.New("github /user returned empty login")
 	}
 
-	quota, ok := planQuota[user.Plan.Name]
+	quota, ok := c.quota[user.Plan.Name]
 	if !ok {
+		// Bare error (no sentinel) is intentional: no current consumer would branch on
+		// a contract-drift sentinel. Add one if a real use case appears.
 		return providers.ProviderOutput{}, fmt.Errorf(
 			"copilot plan %q is not in the known quota table; please file an issue at %s with your plan name (from /user.plan.name)",
 			user.Plan.Name, providers.IssueTrackerURL,
@@ -172,15 +175,18 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 		)
 	}
 
-	// See claude.go: this `now` and main's checked_at are computed from
-	// separate time.Now() calls, so reset_after_seconds + checked_at may
-	// differ from resets_at by up to one second.
-	now := c.now().UTC().Truncate(time.Second)
+	// Two `now` captures: urlNow (pre-billing) drives the URL's year/month and
+	// anchors the reset computation (so a billing call straddling a UTC month
+	// boundary doesn't overshoot the reset by one month). subNow (post-billing)
+	// drives reset_after_seconds so the value reflects clock time after the
+	// billing call completed.
+	urlNow := c.now().UTC().Truncate(time.Second)
 
 	var usage usageResp
-	if err := c.doer.GetJSON(ctx, c.usageURL(user.Login, now.Year(), int(now.Month())), token, &usage, classifyCopilot); err != nil {
+	if err := c.doer.GetJSON(ctx, c.usageURL(user.Login, urlNow.Year(), int(urlNow.Month())), token, timeout, &usage, classifyCopilot); err != nil {
 		return providers.ProviderOutput{}, err
 	}
+	subNow := c.now().UTC().Truncate(time.Second)
 
 	var gross float64
 	var copilotProductItems int
@@ -208,9 +214,9 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	// Limit.MarshalJSON; raw values stay in the struct.
 	used := math.Min(100, (gross/float64(quota))*100)
 
-	year, month, _ := now.Date()
+	year, month, _ := urlNow.Date()
 	reset := time.Date(year, month+1, 1, 0, 0, 0, 0, time.UTC) // month=13 → Jan next year (Go normalizes).
-	secs := int(reset.Sub(now).Seconds())
+	secs := int(reset.Sub(subNow).Seconds())
 	if secs < 0 {
 		secs = 0
 	}

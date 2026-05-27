@@ -5,25 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/internal/testutil"
 )
 
-func loadFixture(t *testing.T, name string) []byte {
-	t.Helper()
-	b, err := os.ReadFile("testdata/" + name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
-}
+const testLogin = "REDACTED" // matches testdata/user.json's "login" field
 
 // routes a httptest server: /user → userFixture; anything matching billing prefix → usageFixture.
 func newRoutedClient(t *testing.T, userFixture, usageFixture []byte, userStatus, usageStatus int, opts ...Option) (*Client, *recordedReqs) {
@@ -45,7 +39,7 @@ func newRoutedClient(t *testing.T, userFixture, usageFixture []byte, userStatus,
 	}))
 	t.Cleanup(srv.Close)
 
-	c := New(nil, "usage-check-test/0", opts...)
+	c := New(nil, "aistat-test/0", opts...)
 	c.doer.Client = srv.Client()
 	c.readToken = func(ctx context.Context) (string, error) { return "gho_fake", nil }
 	c.userURL = srv.URL + "/user"
@@ -66,7 +60,7 @@ func (r *recordedReqs) add(req *http.Request) {
 func TestFetch_JSONRoundsToTwoDecimals(t *testing.T) {
 	// Pro fixture: 23.4 + 126.0 + 10.0 = 159.4 gross, quota 300 → 53.13333…%.
 	// Raw struct value is unrounded; JSON output is rounded to 2 dp.
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +79,7 @@ func TestFetch_JSONRoundsToTwoDecimals(t *testing.T) {
 }
 
 func TestFetch_GoldenFlow_Pro(t *testing.T) {
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -96,7 +90,7 @@ func TestFetch_GoldenFlow_Pro(t *testing.T) {
 	}
 	// Fixture: 23.4 + 126.0 + 10.0 = 159.4 gross. Quota Pro = 300. Used ≈ 53.13%.
 	want := 159.4 / 300 * 100
-	if abs(m.UsedPercent-want) > 0.01 {
+	if math.Abs(m.UsedPercent-want) > 0.01 {
 		t.Errorf("used_percent = %v, want ~%v", m.UsedPercent, want)
 	}
 	if m.RemainingPercent+m.UsedPercent != 100 {
@@ -111,8 +105,8 @@ func TestFetch_GoldenFlow_Pro(t *testing.T) {
 func TestFetch_UnknownPlanIsFailClosed(t *testing.T) {
 	var warnings []string
 	c, rec := newRoutedClient(t,
-		loadFixture(t, "user_unknown_plan.json"),
-		loadFixture(t, "usage.json"),
+		testutil.LoadFixture(t, "user_unknown_plan.json"),
+		testutil.LoadFixture(t, "usage.json"),
 		200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
@@ -139,8 +133,8 @@ func TestFetch_UnknownPlanIsFailClosed(t *testing.T) {
 func TestFetch_UnknownPlanDoesNotInvokeWarn(t *testing.T) {
 	var warnings []string
 	c, _ := newRoutedClient(t,
-		loadFixture(t, "user_unknown_plan.json"),
-		loadFixture(t, "usage.json"),
+		testutil.LoadFixture(t, "user_unknown_plan.json"),
+		testutil.LoadFixture(t, "usage.json"),
 		200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
@@ -151,16 +145,10 @@ func TestFetch_UnknownPlanDoesNotInvokeWarn(t *testing.T) {
 }
 
 func TestFetch_ZeroQuotaIsError(t *testing.T) {
-	// Inject a zero-quota entry to simulate a future bad config. Mutates a
-	// package-level map; this test must NOT call t.Parallel() — any other
-	// copilot test running concurrently against the "pro" plan during the
-	// mutation window would see quota=0. The other copilot tests today are
-	// sequential.
-	original := planQuota["pro"]
-	planQuota["pro"] = 0
-	t.Cleanup(func() { planQuota["pro"] = original })
-
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200)
+	// Inject a zero-quota entry to simulate a future bad config. The quota map
+	// is per-Client so this is safe under t.Parallel() if added later.
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
+	c.quota = map[string]int{"pro": 0}
 	_, err := c.Fetch(context.Background())
 	if err == nil {
 		t.Fatal("expected error on zero quota")
@@ -172,7 +160,7 @@ func TestFetch_ZeroQuotaIsError(t *testing.T) {
 
 func TestFetch_OverageClampsAt100(t *testing.T) {
 	overage := []byte(`{"usageItems":[{"product":"Copilot","sku":"Copilot Premium Request","grossQuantity":400}]}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), overage, 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), overage, 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +174,7 @@ func TestFetch_OverageClampsAt100(t *testing.T) {
 }
 
 func TestFetch_EmptyUsageItems(t *testing.T) {
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), []byte(`{"usageItems":[]}`), 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), []byte(`{"usageItems":[]}`), 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +191,7 @@ func TestFetch_SkuMismatchTripsWarning(t *testing.T) {
 		{"product":"Copilot","sku":"Copilot Premium Request (Renamed)","grossQuantity":100}
 	]}`)
 	var warnings []string
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
 	out, err := c.Fetch(context.Background())
@@ -230,7 +218,7 @@ func TestFetch_NonCopilotProductDoesNotWarn(t *testing.T) {
 		{"product":"Actions","sku":"Compute","grossQuantity":1000}
 	]}`)
 	var warnings []string
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
 	out, err := c.Fetch(context.Background())
@@ -254,7 +242,7 @@ func TestFetch_NonPremiumCopilotItemsWarn(t *testing.T) {
 		{"product":"Copilot","sku":"Copilot Chat","grossQuantity":50}
 	]}`)
 	var warnings []string
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
 	out, err := c.Fetch(context.Background())
@@ -276,7 +264,7 @@ func TestFetch_PremiumSkuPresentWithZeroGrossDoesNotWarn(t *testing.T) {
 		{"product":"Copilot","sku":"Copilot Premium Request","grossQuantity":0}
 	]}`)
 	var warnings []string
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200,
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
 	out, err := c.Fetch(context.Background())
@@ -296,13 +284,13 @@ func TestFetch_NonCopilotItemsFiltered(t *testing.T) {
 		{"product":"Actions","sku":"Compute","grossQuantity":1000},
 		{"product":"Copilot","sku":"Copilot Premium Request","grossQuantity":30}
 	]}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := 30.0 / 300 * 100 // 10%
-	if abs(out.Limits["month"].UsedPercent-want) > 0.01 {
+	if math.Abs(out.Limits["month"].UsedPercent-want) > 0.01 {
 		t.Errorf("non-Copilot items leaked into sum: got %v, want ~%v", out.Limits["month"].UsedPercent, want)
 	}
 }
@@ -312,7 +300,7 @@ func TestFetch_UserEndpoint404IsNotMisclassified(t *testing.T) {
 	// scope-missing tripwire is specific to the billing endpoint. A /user
 	// 404 (rare; happens during partial GitHub outages or endpoint
 	// deprecation) should surface as a bare HTTP 404 error.
-	c, _ := newRoutedClient(t, []byte(`{"message":"Not Found"}`), loadFixture(t, "usage.json"), 404, 200)
+	c, _ := newRoutedClient(t, []byte(`{"message":"Not Found"}`), testutil.LoadFixture(t, "usage.json"), 404, 200)
 	_, err := c.Fetch(context.Background())
 	if err == nil {
 		t.Fatal("expected error on /user 404")
@@ -330,7 +318,7 @@ func TestFetch_UserEndpoint404IsNotMisclassified(t *testing.T) {
 
 func TestFetch_404MissingScope(t *testing.T) {
 	body := []byte(`{"message":"Not Found","documentation_url":"...","status":"404"}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 404)
 	_, err := c.Fetch(context.Background())
 	if !errors.Is(err, providers.ErrAuthMissing) {
 		t.Errorf("expected ErrAuthMissing on 404, got: %v", err)
@@ -342,7 +330,7 @@ func TestFetch_404MissingScope(t *testing.T) {
 
 func TestFetch_404_LowercaseNotFound(t *testing.T) {
 	body := []byte(`{"message":"not found"}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 404)
 	_, err := c.Fetch(context.Background())
 	if !errors.Is(err, providers.ErrAuthMissing) {
 		t.Errorf("lowercase \"not found\" must trip ErrAuthMissing, got: %v", err)
@@ -351,7 +339,7 @@ func TestFetch_404_LowercaseNotFound(t *testing.T) {
 
 func TestFetch_404_ResourceNotFound(t *testing.T) {
 	body := []byte(`{"message":"Resource not found"}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 404)
 	_, err := c.Fetch(context.Background())
 	if !errors.Is(err, providers.ErrAuthMissing) {
 		t.Errorf("\"Resource not found\" must trip ErrAuthMissing, got: %v", err)
@@ -362,7 +350,7 @@ func TestFetch_404_UnknownMessage(t *testing.T) {
 	// A 404 with a JSON body but an unrecognized message must NOT be
 	// classified as missing-scope; the cause is genuinely something else.
 	body := []byte(`{"message":"Forbidden"}`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 404)
 	_, err := c.Fetch(context.Background())
 	if errors.Is(err, providers.ErrAuthMissing) {
 		t.Errorf("unrecognized 404 message must NOT trip ErrAuthMissing, got: %v", err)
@@ -378,7 +366,7 @@ func TestFetch_404_NonJSONBody(t *testing.T) {
 	// "Not Found" would have tripped the missing-scope path; the new JSON
 	// decode rejects that and we surface as bare HTTP 404.
 	body := []byte(`<html>Not Found</html>`)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 404)
 	_, err := c.Fetch(context.Background())
 	if errors.Is(err, providers.ErrAuthMissing) {
 		t.Errorf("non-JSON 404 must NOT trip ErrAuthMissing, got: %v", err)
@@ -423,7 +411,7 @@ func TestFetch_408IsTransient(t *testing.T) {
 func TestFetch_NetworkErrorIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close()
-	c := New(nil, "usage-check-test/0")
+	c := New(nil, "aistat-test/0")
 	c.doer.Client = srv.Client()
 	c.userURL = srv.URL + "/user"
 	c.readToken = func(ctx context.Context) (string, error) { return "tok", nil }
@@ -438,7 +426,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 		time.Sleep(time.Second)
 	}))
 	defer srv.Close()
-	c := New(nil, "usage-check-test/0")
+	c := New(nil, "aistat-test/0")
 	c.doer.Client = srv.Client()
 	c.userURL = srv.URL + "/user"
 	c.readToken = func(ctx context.Context) (string, error) { return "tok", nil }
@@ -454,7 +442,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 }
 
 func TestFetch_TokenMissingIsAuthMissing(t *testing.T) {
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 	c.readToken = func(ctx context.Context) (string, error) { return "", cred.ErrGitHubTokenNotFound }
 	_, err := c.Fetch(context.Background())
 	if !errors.Is(err, providers.ErrAuthMissing) {
@@ -467,7 +455,7 @@ func TestFetch_TokenMissingIsAuthMissing(t *testing.T) {
 
 func TestFetch_RequestShape(t *testing.T) {
 	fixed := time.Date(2024, time.March, 15, 0, 0, 0, 0, time.UTC)
-	c, rec := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200, WithNow(func() time.Time { return fixed }))
+	c, rec := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200, WithNow(func() time.Time { return fixed }))
 	_, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -485,14 +473,14 @@ func TestFetch_RequestShape(t *testing.T) {
 		if r.Header.Get("Accept") != "application/vnd.github+json" {
 			t.Errorf("Accept wrong: %q", r.Header.Get("Accept"))
 		}
-		if !strings.Contains(r.Header.Get("User-Agent"), "usage-check") {
+		if !strings.Contains(r.Header.Get("User-Agent"), "aistat") {
 			t.Errorf("User-Agent missing: %q", r.Header.Get("User-Agent"))
 		}
 	}
 	if rec.reqs[0].URL.Path != "/user" {
 		t.Errorf("first call path = %s, want /user", rec.reqs[0].URL.Path)
 	}
-	if !strings.HasPrefix(rec.reqs[1].URL.Path, "/users/REDACTED/") {
+	if !strings.HasPrefix(rec.reqs[1].URL.Path, "/users/"+testLogin+"/") {
 		t.Errorf("second call path = %s", rec.reqs[1].URL.Path)
 	}
 	if got := rec.reqs[1].URL.Query().Get("year"); got != "2024" {
@@ -504,7 +492,7 @@ func TestFetch_RequestShape(t *testing.T) {
 }
 
 func TestFetch_EmptyLogin(t *testing.T) {
-	c, _ := newRoutedClient(t, []byte(`{"login":"","plan":{"name":"pro"}}`), loadFixture(t, "usage.json"), 200, 200)
+	c, _ := newRoutedClient(t, []byte(`{"login":"","plan":{"name":"pro"}}`), testutil.LoadFixture(t, "usage.json"), 200, 200)
 	_, err := c.Fetch(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "empty login") {
 		t.Errorf("expected empty-login error, got: %v", err)
@@ -516,7 +504,7 @@ func TestFetch_ResetAfterSecondsTruncated(t *testing.T) {
 	// the 789ms residue shaves a second off ResetAfterSeconds via int(...)
 	// rounding toward zero; with truncation, it does not.
 	frozen := time.Date(2026, 5, 15, 12, 34, 56, 789_000_000, time.UTC)
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200,
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200,
 		WithNow(func() time.Time { return frozen }),
 	)
 	out, err := c.Fetch(context.Background())
@@ -532,7 +520,7 @@ func TestFetch_ResetAfterSecondsTruncated(t *testing.T) {
 }
 
 func TestFetch_ResetTimeStartOfNextMonth(t *testing.T) {
-	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200)
+	c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -543,9 +531,88 @@ func TestFetch_ResetTimeStartOfNextMonth(t *testing.T) {
 	}
 }
 
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
+func TestFetch_ResetSecondsRecomputedAfterBillingCall(t *testing.T) {
+	// Two increasing `now` values returned on successive calls.
+	// idx==0 used for urlNow; idx==1 used for subNow → reset_after_seconds
+	// must reflect base+5s, not base.
+	base := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	var idx int
+	c, _ := newRoutedClient(t,
+		testutil.LoadFixture(t, "user.json"),
+		testutil.LoadFixture(t, "usage.json"),
+		200, 200,
+		WithNow(func() time.Time {
+			defer func() { idx++ }()
+			return base.Add(time.Duration(idx) * 5 * time.Second)
+		}),
+	)
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	return f
+	expectedReset := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	expectedSecs := int(expectedReset.Sub(base.Add(5 * time.Second)).Seconds())
+	if got := out.Limits["month"].ResetAfterSeconds; got != expectedSecs {
+		t.Errorf("ResetAfterSeconds=%d, want %d (must use post-billing now)", got, expectedSecs)
+	}
 }
+
+// deadlineCapturingTransport wraps an underlying RoundTripper and records the
+// request ctx's deadline before each round-trip. Used to verify that two
+// in-process calls receive independent per-request deadlines.
+type deadlineCapturingTransport struct {
+	inner     http.RoundTripper
+	deadlines []time.Time
+	sleeps    []time.Duration // optional per-call pre-roundtrip sleep
+	idx       int
+}
+
+func (t *deadlineCapturingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if d, ok := req.Context().Deadline(); ok {
+		t.deadlines = append(t.deadlines, d)
+	} else {
+		t.deadlines = append(t.deadlines, time.Time{})
+	}
+	if t.idx < len(t.sleeps) {
+		time.Sleep(t.sleeps[t.idx])
+	}
+	t.idx++
+	return t.inner.RoundTrip(req)
+}
+
+func TestFetch_BothCallsGetIndependentDeadlines(t *testing.T) {
+	// Two stub responses, served via a routed server; transport captures the
+	// per-request ctx deadline. The 20ms sleep on call 1 forces wall-clock
+	// separation so the two WithTimeout derivations land at different times.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			w.WriteHeader(200)
+			w.Write(testutil.LoadFixture(t, "user.json"))
+			return
+		}
+		w.WriteHeader(200)
+		w.Write(testutil.LoadFixture(t, "usage.json"))
+	}))
+	t.Cleanup(srv.Close)
+	tr := &deadlineCapturingTransport{inner: srv.Client().Transport, sleeps: []time.Duration{20 * time.Millisecond}}
+	c := New(nil, "aistat-test/0")
+	c.doer.Client = &http.Client{Transport: tr}
+	c.readToken = func(ctx context.Context) (string, error) { return "gho_fake", nil }
+	c.userURL = srv.URL + "/user"
+	c.usageURL = func(login string, year int, month int) string {
+		return fmt.Sprintf("%s/users/%s/settings/billing/premium_request/usage?year=%d&month=%d", srv.URL, login, year, month)
+	}
+	if _, err := c.Fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.deadlines) != 2 {
+		t.Fatalf("expected 2 deadlines, got %d", len(tr.deadlines))
+	}
+	if tr.deadlines[0].IsZero() || tr.deadlines[1].IsZero() {
+		t.Fatalf("both calls must have a deadline; got %v", tr.deadlines)
+	}
+	if delta := tr.deadlines[1].Sub(tr.deadlines[0]); delta < 10*time.Millisecond {
+		t.Errorf("second call's deadline should be later by ≥10ms (proves independent derivation); got delta=%v", delta)
+	}
+}
+

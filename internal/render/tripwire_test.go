@@ -3,9 +3,9 @@ package render
 import (
 	"testing"
 
-	"github.com/drogers0/llm-usage/internal/providers/claude"
-	"github.com/drogers0/llm-usage/internal/providers/codex"
-	"github.com/drogers0/llm-usage/internal/providers/copilot"
+	"github.com/drogers0/aistat/internal/providers/claude"
+	"github.com/drogers0/aistat/internal/providers/codex"
+	"github.com/drogers0/aistat/internal/providers/copilot"
 )
 
 // TestTextLabels_ExactlyMatchKnownWindows asserts both directions of the

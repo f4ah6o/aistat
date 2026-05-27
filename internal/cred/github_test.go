@@ -58,3 +58,19 @@ func TestReadGitHubToken_DeadlineKillsCommand(t *testing.T) {
 		t.Errorf("deadline-killed cmd must not wrap ErrGitHubTokenNotFound: %v", err)
 	}
 }
+
+// TestReadGitHubToken_PreservesExecErrorChainOnMissingBinary pins the contract
+// that the %w double-wrap (sentinel + inner) preserves *exec.Error in the
+// chain so future error-classification logic can use errors.As to detect
+// missing-binary cases.
+func TestReadGitHubToken_PreservesExecErrorChainOnMissingBinary(t *testing.T) {
+	t.Setenv("PATH", "") // forces exec.LookPath inside CommandContext to fail
+	_, err := ReadGitHubToken(context.Background())
+	if !errors.Is(err, ErrGitHubTokenNotFound) {
+		t.Fatalf("expected ErrGitHubTokenNotFound, got %v", err)
+	}
+	var pe *exec.Error
+	if !errors.As(err, &pe) {
+		t.Errorf("inner *exec.Error not preserved in chain: %v", err)
+	}
+}

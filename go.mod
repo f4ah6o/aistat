@@ -1,3 +1,3 @@
-module github.com/drogers0/llm-usage
+module github.com/drogers0/aistat
 
 go 1.22

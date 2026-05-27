@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 // TestLive_RealKeychainAndEndpoint hits the user's real macOS Keychain and
 // api.anthropic.com. Opt-in: `go test -tags live ./internal/providers/claude`.
 // Confirms the live response still parses to >0 limits.
 func TestLive_RealKeychainAndEndpoint(t *testing.T) {
-	c := New(nil, "usage-check-live-test/0")
+	c := New(nil, "aistat-live-test/0")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	out, err := c.Fetch(ctx)

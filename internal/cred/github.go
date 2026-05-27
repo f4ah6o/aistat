@@ -33,11 +33,11 @@ func ReadGitHubToken(ctx context.Context) (string, error) {
 		var pe *exec.Error
 		switch {
 		case errors.As(err, &pe):
-			return "", fmt.Errorf("%w: gh not on PATH (%s)", ErrGitHubTokenNotFound, pe.Error())
+			return "", fmt.Errorf("%w: gh not on PATH: %w", ErrGitHubTokenNotFound, pe)
 		case errors.As(err, &ee):
-			return "", fmt.Errorf("%w: gh auth token failed: %s", ErrGitHubTokenNotFound, strings.TrimSpace(stderr.String()))
+			return "", fmt.Errorf("%w: gh auth token failed: %s: %w", ErrGitHubTokenNotFound, strings.TrimSpace(stderr.String()), ee)
 		}
-		return "", fmt.Errorf("%w: gh auth token failed: %s", ErrGitHubTokenNotFound, err.Error())
+		return "", fmt.Errorf("%w: gh auth token failed: %w", ErrGitHubTokenNotFound, err)
 	}
 	token := strings.TrimSpace(string(out))
 	if token == "" {

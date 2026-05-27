@@ -1,14 +1,14 @@
 version: 2
-project_name: usage-check
+project_name: aistat
 
 before:
   hooks:
     - go mod tidy
 
 builds:
-  - id: usage-check
-    main: ./cmd/usage-check
-    binary: usage-check
+  - id: aistat
+    main: ./cmd/aistat
+    binary: aistat
     env:
       - CGO_ENABLED=0
     goos: [linux, darwin]
@@ -37,6 +37,6 @@ changelog:
 release:
   github:
     owner: drogers0
-    name: llm-usage
+    name: aistat
   draft: false
   prerelease: auto

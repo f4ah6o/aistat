@@ -20,7 +20,7 @@ var ErrCodexTokenNotFound = errors.New(CodexTokenMissingMessage)
 func ReadCodexToken(ctx context.Context) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("%w: cannot resolve home directory ($HOME unset): %s", ErrCodexTokenNotFound, err.Error())
+		return "", fmt.Errorf("%w: cannot resolve home directory ($HOME unset): %w", ErrCodexTokenNotFound, err)
 	}
 	data, err := os.ReadFile(filepath.Join(home, ".codex", "auth.json"))
 	if err != nil {

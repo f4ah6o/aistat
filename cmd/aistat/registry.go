@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
-	"github.com/drogers0/llm-usage/internal/providers/claude"
-	"github.com/drogers0/llm-usage/internal/providers/codex"
-	"github.com/drogers0/llm-usage/internal/providers/copilot"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/internal/providers/claude"
+	"github.com/drogers0/aistat/internal/providers/codex"
+	"github.com/drogers0/aistat/internal/providers/copilot"
 )
 
 // realProviders constructs the live providers. safeStderr is the
@@ -30,11 +30,11 @@ func realProviders(safeStderr *httpx.ConcurrencySafeWriter, includeDebug bool) [
 }
 
 // wrapWarn returns the warn callback wired into copilot.New. Every line the
-// provider emits is prefixed with "usage-check: " so the source is obvious
+// provider emits is prefixed with "aistat: " so the source is obvious
 // when --debug is OFF and only the SKU-drift line surfaces. Extracted from
 // realProviders so the prefix contract is unit-testable without HTTP.
 func wrapWarn(out io.Writer) func(string) {
-	return func(s string) { fmt.Fprintln(out, "usage-check: "+s) }
+	return func(s string) { fmt.Fprintln(out, "aistat: "+s) }
 }
 
 // buildProviders resolves the provider set (fake-mode-first), picks the

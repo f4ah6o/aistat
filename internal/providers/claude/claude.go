@@ -2,21 +2,21 @@ package claude
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 const (
-	endpoint   = "https://api.anthropic.com/api/oauth/usage"
-	betaHeader = "oauth-2025-04-20"
-	timeout    = 10 * time.Second
+	endpoint    = "https://api.anthropic.com/api/oauth/usage"
+	betaHeader  = "oauth-2025-04-20"
+	timeout     = 10 * time.Second
+	credTimeout = 10 * time.Second
 )
 
 // KnownWindows is the closed set of API keys we surface. Adding an entry here
@@ -48,13 +48,13 @@ func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn }
 
 func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	c := &Client{
-		doer: &httpx.Doer{
-			Client:       &http.Client{}, // ctx-scoped deadline in Fetch replaces a per-client Timeout. Redirect policy: see httpx.Doer doc.
-			UserAgent:    userAgent,
-			ProviderID:   "claude",
-			ExtraHeaders: map[string]string{"Anthropic-Beta": betaHeader},
-			Debug:        debug,
-		},
+		doer: httpx.NewDoer(
+			&http.Client{CheckRedirect: httpx.RejectSchemeDowngrade},
+			userAgent,
+			"claude",
+			map[string]string{"Anthropic-Beta": betaHeader},
+			debug,
+		),
 		endpoint:  endpoint,
 		readToken: cred.ReadClaudeToken,
 		now:       time.Now,
@@ -73,19 +73,15 @@ type window struct {
 }
 
 func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	token, err := c.readToken(ctx)
+	credCtx, credCancel := context.WithTimeout(ctx, credTimeout)
+	token, err := c.readToken(credCtx)
+	credCancel()
 	if err != nil {
-		if errors.Is(err, cred.ErrClaudeTokenNotFound) {
-			return providers.ProviderOutput{}, fmt.Errorf("%w: %s", providers.ErrAuthMissing, err.Error())
-		}
-		return providers.ProviderOutput{}, err
+		return providers.ProviderOutput{}, providers.ClassifyCredError(err, cred.ErrClaudeTokenNotFound)
 	}
 
 	var raw map[string]*window
-	if err := c.doer.GetJSON(ctx, c.endpoint, token, &raw, httpx.DefaultClassify); err != nil {
+	if err := c.doer.GetJSON(ctx, c.endpoint, token, timeout, &raw, httpx.DefaultClassify); err != nil {
 		return providers.ProviderOutput{}, err
 	}
 

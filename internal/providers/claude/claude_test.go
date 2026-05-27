@@ -5,39 +5,23 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/internal/testutil"
 )
-
-func loadFixture(t *testing.T) []byte {
-	t.Helper()
-	b, err := os.ReadFile("testdata/usage.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
-}
 
 func newTestClient(t *testing.T, body []byte, status int, captureReq *http.Request) *Client {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captureReq != nil {
-			*captureReq = *r.Clone(context.Background())
-		}
-		w.WriteHeader(status)
-		w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
+	srv := testutil.NewStubServer(t, body, status, captureReq)
 	return &Client{
 		doer: &httpx.Doer{
 			Client:       srv.Client(),
-			UserAgent:    "usage-check-test/0",
+			UserAgent:    "aistat-test/0",
 			ProviderID:   "claude",
 			ExtraHeaders: map[string]string{"Anthropic-Beta": betaHeader},
 		},
@@ -68,7 +52,7 @@ func TestFetch_ResetAfterSecondsTruncated(t *testing.T) {
 }
 
 func TestFetch_GoldenFixture(t *testing.T) {
-	c := newTestClient(t, loadFixture(t), 200, nil)
+	c := newTestClient(t, testutil.LoadFixture(t, "usage.json"), 200, nil)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +98,7 @@ func TestFetch_NullResetsAtIsSkipped(t *testing.T) {
 
 func TestFetch_RequestShape(t *testing.T) {
 	var got http.Request
-	c := newTestClient(t, loadFixture(t), 200, &got)
+	c := newTestClient(t, testutil.LoadFixture(t, "usage.json"), 200, &got)
 	_, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -131,7 +115,7 @@ func TestFetch_RequestShape(t *testing.T) {
 	if h := got.Header.Get("Anthropic-Beta"); h != "oauth-2025-04-20" {
 		t.Errorf("anthropic-beta = %q", h)
 	}
-	if h := got.Header.Get("User-Agent"); !strings.Contains(h, "usage-check") {
+	if h := got.Header.Get("User-Agent"); !strings.Contains(h, "aistat") {
 		t.Errorf("User-Agent missing: %q", h)
 	}
 }
@@ -186,7 +170,7 @@ func TestFetch_NetworkErrorIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close() // shut down before any request
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "claude"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "aistat-test/0", ProviderID: "claude"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 		now:       time.Now,
@@ -203,7 +187,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "claude"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "aistat-test/0", ProviderID: "claude"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 		now:       time.Now,

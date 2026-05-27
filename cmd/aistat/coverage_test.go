@@ -4,8 +4,8 @@ import (
 	"io"
 	"testing"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 // TestRealProvidersCoversKnownIDs is a tripwire: if a new provider is added to

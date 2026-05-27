@@ -5,19 +5,23 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 type stubProvider struct {
 	id      string
 	calls   atomic.Int32
 	results []stubResult // consumed in order; last entry repeats if exhausted
-	delay   time.Duration
+	// fetch, if non-nil, takes precedence over results — used by deterministic
+	// tests that need to coordinate with the orchestrator (barriers, channel
+	// signals, etc.) rather than play back canned results.
+	fetch func(context.Context) (providers.ProviderOutput, error)
 }
 
 type stubResult struct {
@@ -28,14 +32,11 @@ type stubResult struct {
 func (s *stubProvider) ID() string { return s.id }
 
 func (s *stubProvider) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
-	idx := int(s.calls.Add(1)) - 1
-	if s.delay > 0 {
-		select {
-		case <-time.After(s.delay):
-		case <-ctx.Done():
-			return providers.ProviderOutput{}, ctx.Err()
-		}
+	s.calls.Add(1)
+	if s.fetch != nil {
+		return s.fetch(ctx)
 	}
+	idx := int(s.calls.Load()) - 1
 	if idx >= len(s.results) {
 		idx = len(s.results) - 1
 	}
@@ -175,21 +176,34 @@ func TestFetchOnce_DebugLineSingleLineOnMultilineError(t *testing.T) {
 }
 
 func TestRun_ContextCancellationDuringBackoff(t *testing.T) {
+	// Deterministic: stub signals on a channel as soon as the first call begins;
+	// the test reads the signal, cancels the parent ctx, then a 1s backoff makes
+	// the orchestrator's <-time.After(backoff) lose to <-ctx.Done() with no race.
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &stubProvider{id: "claude", results: []stubResult{
-		{err: fmt.Errorf("%w: HTTP 503", providers.ErrTransient)},
-		{out: mkOutput(2)}, // shouldn't be reached
+	defer cancel()
+
+	firstCallDone := make(chan struct{})
+	p := &stubProvider{id: "claude", fetch: func(_ context.Context) (providers.ProviderOutput, error) {
+		close(firstCallDone)
+		return providers.ProviderOutput{}, fmt.Errorf("%w: HTTP 503", providers.ErrTransient)
 	}}
-	// cancel right after the first call returns
+
+	runDone := make(chan struct{})
+	var report providers.Report
+	var status ExitStatus
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
+		defer close(runDone)
+		report, status = Run(ctx, []string{"claude"}, []providers.Provider{p}, Options{RetryBackoff: 1 * time.Second})
 	}()
-	r, status := Run(ctx, []string{"claude"}, []providers.Provider{p}, Options{})
+
+	<-firstCallDone
+	cancel()
+	<-runDone
+
 	if status != StatusAnyFailed {
 		t.Errorf("status should be AnyFailed on cancellation, got %d", status)
 	}
-	if errMsg := r.Providers["claude"].Error; !strings.Contains(errMsg, "context canceled") {
+	if errMsg := report.Providers["claude"].Error; !strings.Contains(errMsg, "context canceled") {
 		t.Errorf("expected context canceled error, got %q", errMsg)
 	}
 	if p.calls.Load() != 1 {
@@ -198,17 +212,30 @@ func TestRun_ContextCancellationDuringBackoff(t *testing.T) {
 }
 
 func TestRun_ConcurrentExecution(t *testing.T) {
-	delay := 100 * time.Millisecond
-	p1 := &stubProvider{id: "claude", delay: delay, results: []stubResult{{out: mkOutput(1)}}}
-	p2 := &stubProvider{id: "codex", delay: delay, results: []stubResult{{out: mkOutput(2)}}}
-	p3 := &stubProvider{id: "copilot", delay: delay, results: []stubResult{{out: mkOutput(3)}}}
-	start := time.Now()
-	_, _ = Run(context.Background(), []string{"claude", "codex", "copilot"}, []providers.Provider{p1, p2, p3}, Options{})
-	elapsed := time.Since(start)
-	// Concurrent execution should be ~100ms, well under 300ms (sequential).
-	if elapsed > 250*time.Millisecond {
-		t.Errorf("expected concurrent execution under 250ms, got %v (sequential would be ~300ms)", elapsed)
+	// Deterministic concurrency proof: all three stubs hit a barrier (WaitGroup
+	// countdown) before any can proceed. arrived.Wait() returns only when every
+	// goroutine has reached the barrier, which can only happen under concurrent
+	// execution.
+	var arrived sync.WaitGroup
+	arrived.Add(3)
+	release := make(chan struct{})
+	barrier := func(_ context.Context) (providers.ProviderOutput, error) {
+		arrived.Done()
+		<-release
+		return mkOutput(1), nil
 	}
+	p1 := &stubProvider{id: "claude", fetch: barrier}
+	p2 := &stubProvider{id: "codex", fetch: barrier}
+	p3 := &stubProvider{id: "copilot", fetch: barrier}
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_, _ = Run(context.Background(), []string{"claude", "codex", "copilot"}, []providers.Provider{p1, p2, p3}, Options{})
+	}()
+	arrived.Wait() // proves all three reached Fetch concurrently
+	close(release)
+	<-runDone
 }
 
 // Verify the orchestrator does not pre-validate provider existence — main does.

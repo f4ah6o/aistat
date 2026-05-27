@@ -14,12 +14,12 @@ import (
 var binPath string
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "usage-check-test-")
+	dir, err := os.MkdirTemp("", "aistat-test-")
 	if err != nil {
 		panic(err)
 	}
 	defer os.RemoveAll(dir)
-	binPath = filepath.Join(dir, "usage-check")
+	binPath = filepath.Join(dir, "aistat")
 	out, err := exec.Command("go", "build", "-tags=fake", "-o", binPath, ".").CombinedOutput()
 	if err != nil {
 		os.Stderr.Write(out)
@@ -199,7 +199,7 @@ func TestCLI_Help(t *testing.T) {
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d", r.code)
 	}
-	if !strings.Contains(r.stdout, "usage-check") {
+	if !strings.Contains(r.stdout, "aistat") {
 		t.Fatalf("help missing program name: %s", r.stdout)
 	}
 	if !strings.Contains(r.stdout, "-h, --human") {

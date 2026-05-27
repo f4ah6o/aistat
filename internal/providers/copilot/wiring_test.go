@@ -7,15 +7,15 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 // TestWiring_WarnFiresWithCopilotPrefix verifies the provider-side warn
 // contract: when Copilot-product usage items are present but no premium-SKU
 // match is observed, the warn callback fires exactly once with a message
 // containing "copilot:", "none matched", and the issue-tracker URL. The
-// `cmd/usage-check` layer is responsible for the outer "usage-check: "
-// prefix (tested in cmd/usage-check/realproviders_test.go).
+// `cmd/aistat` layer is responsible for the outer "aistat: "
+// prefix (tested in cmd/aistat/realproviders_test.go).
 func TestWiring_WarnFiresWithCopilotPrefix(t *testing.T) {
 	userBody := `{"login":"test","plan":{"name":"pro"}}`
 	skuMismatchBody := `{"usageItems":[{"product":"Copilot","sku":"Copilot Premium Request (Renamed)","grossQuantity":100}]}`
@@ -29,7 +29,7 @@ func TestWiring_WarnFiresWithCopilotPrefix(t *testing.T) {
 	defer srv.Close()
 
 	var warnings []string
-	c := New(nil, "usage-check-test/0", WithWarn(func(s string) { warnings = append(warnings, s) }))
+	c := New(nil, "aistat-test/0", WithWarn(func(s string) { warnings = append(warnings, s) }))
 	c.doer.Client = srv.Client()
 	c.userURL = srv.URL + "/user"
 	c.usageURL = func(login string, year int, month int) string {

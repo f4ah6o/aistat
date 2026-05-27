@@ -10,10 +10,10 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/orchestrate"
-	"github.com/drogers0/llm-usage/internal/providers"
-	"github.com/drogers0/llm-usage/internal/render"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/orchestrate"
+	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/internal/render"
 )
 
 // version is the goreleaser-injected build tag (via `-ldflags "-X main.version=..."`);
@@ -33,26 +33,28 @@ func resolvedVersion() string {
 }
 
 func userAgent() string {
-	return fmt.Sprintf("usage-check/%s (+%s)", resolvedVersion(), providers.ProjectURL)
+	return fmt.Sprintf("aistat/%s (+%s)", resolvedVersion(), providers.ProjectURL)
 }
 
-var knownServices = func() map[string]bool {
+var knownServices = buildKnownServices()
+
+func buildKnownServices() map[string]bool {
 	m := make(map[string]bool, len(providers.KnownProviderIDs))
 	for _, id := range providers.KnownProviderIDs {
 		m[id] = true
 	}
 	return m
-}()
+}
 
 var helpText = buildHelpText()
 
 func buildHelpText() string {
 	var sb strings.Builder
-	sb.WriteString("usage-check — report Claude, Codex, and Copilot usage\n\nUsage:\n  usage-check [provider] [flags]\n\nProviders (optional, must be the first argument):\n")
+	sb.WriteString("aistat — report Claude, Codex, and Copilot usage\n\nUsage:\n  aistat [provider] [flags]\n\nProviders (optional, must be the first argument):\n")
 	for _, id := range providers.KnownProviderIDs {
 		fmt.Fprintf(&sb, "  %-9s Only query %s\n", id, providers.Title(id))
 	}
-	sb.WriteString("  (none)    Query all providers\n\nFlags:\n  -h, --human   Render human-readable text instead of JSON (default JSON)\n      --debug   Write per-request and per-provider lines to stderr\n      --version Print version and exit\n      --help    Print this help and exit\n")
+	sb.WriteString("  (none)    Query all providers\n\nFlags:\n  -h, --human   Render human-readable text instead of JSON (default JSON)\n      --debug   Write per-request and per-provider lines to stderr\n      --version Print version and exit\n      --help    Print this help and exit\n\nExit codes:\n  0  All requested providers succeeded.\n  1  One or more requested providers failed at runtime.\n  2  Usage error (unknown provider, malformed flags).\n  3  Stdout write error (broken pipe, disk full).\n")
 	return sb.String()
 }
 
@@ -77,7 +79,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	fs := flag.NewFlagSet("usage-check", flag.ContinueOnError)
+	fs := flag.NewFlagSet("aistat", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {} // silence default Usage; we print our own help on --help.
 
@@ -129,7 +131,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	if renderErr != nil {
 		fmt.Fprintln(stderr, renderErr.Error())
-		return 1
+		return int(orchestrate.StatusRenderError)
 	}
 	return int(status)
 }

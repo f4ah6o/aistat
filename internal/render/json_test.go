@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 func TestJSON_DesignSample(t *testing.T) {

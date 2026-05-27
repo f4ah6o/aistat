@@ -8,17 +8,18 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 const (
 	// Undocumented internal endpoint shared with the ChatGPT web app. Shape
 	// may change without notice; the limit_window_seconds assertions below
 	// act as a tripwire.
-	endpoint = "https://chatgpt.com/backend-api/wham/usage"
-	timeout  = 10 * time.Second
+	endpoint    = "https://chatgpt.com/backend-api/wham/usage"
+	timeout     = 10 * time.Second
+	credTimeout = 10 * time.Second
 
 	primaryWindowSeconds   = 18000  // 5 hours
 	secondaryWindowSeconds = 604800 // 7 days
@@ -49,12 +50,13 @@ func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn }
 
 func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	c := &Client{
-		doer: &httpx.Doer{
-			Client:     &http.Client{}, // ctx-scoped deadline in Fetch replaces a per-client Timeout. Redirect policy: see httpx.Doer doc.
-			UserAgent:  userAgent,
-			ProviderID: "codex",
-			Debug:      debug,
-		},
+		doer: httpx.NewDoer(
+			&http.Client{CheckRedirect: httpx.RejectSchemeDowngrade},
+			userAgent,
+			"codex",
+			nil,
+			debug,
+		),
 		endpoint:  endpoint,
 		readToken: cred.ReadCodexToken,
 		now:       time.Now,
@@ -83,19 +85,15 @@ type response struct {
 }
 
 func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	token, err := c.readToken(ctx)
+	credCtx, credCancel := context.WithTimeout(ctx, credTimeout)
+	token, err := c.readToken(credCtx)
+	credCancel()
 	if err != nil {
-		if errors.Is(err, cred.ErrCodexTokenNotFound) {
-			return providers.ProviderOutput{}, fmt.Errorf("%w: %s", providers.ErrAuthMissing, err.Error())
-		}
-		return providers.ProviderOutput{}, err
+		return providers.ProviderOutput{}, providers.ClassifyCredError(err, cred.ErrCodexTokenNotFound)
 	}
 
 	var raw response
-	if err := c.doer.GetJSON(ctx, c.endpoint, token, &raw, httpx.DefaultClassify); err != nil {
+	if err := c.doer.GetJSON(ctx, c.endpoint, token, timeout, &raw, httpx.DefaultClassify); err != nil {
 		return providers.ProviderOutput{}, err
 	}
 	if raw.RateLimit == nil {

@@ -6,38 +6,22 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/cred"
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/cred"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/internal/testutil"
 )
-
-func loadFixture(t *testing.T, name string) []byte {
-	t.Helper()
-	b, err := os.ReadFile("testdata/" + name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return b
-}
 
 func newTestClient(t *testing.T, body []byte, status int, captureReq *http.Request) *Client {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if captureReq != nil {
-			*captureReq = *r.Clone(context.Background())
-		}
-		w.WriteHeader(status)
-		w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
+	srv := testutil.NewStubServer(t, body, status, captureReq)
 	return &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "codex"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "aistat-test/0", ProviderID: "codex"},
 		endpoint:  srv.URL + "/backend-api/wham/usage",
 		readToken: func(ctx context.Context) (string, error) { return "fake-jwt", nil },
 		now:       time.Now,
@@ -66,7 +50,7 @@ func TestFetch_ResetAfterSecondsTruncated(t *testing.T) {
 }
 
 func TestFetch_GoldenFixture_TwoWindows(t *testing.T) {
-	c := newTestClient(t, loadFixture(t, "usage.json"), 200, nil)
+	c := newTestClient(t, testutil.LoadFixture(t, "usage.json"), 200, nil)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +169,7 @@ func buildResponseForKeys(t *testing.T, keys []string) []byte {
 }
 
 func TestFetch_CodeReviewIncluded(t *testing.T) {
-	c := newTestClient(t, loadFixture(t, "usage_with_code_review.json"), 200, nil)
+	c := newTestClient(t, testutil.LoadFixture(t, "usage_with_code_review.json"), 200, nil)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +185,7 @@ func TestFetch_CodeReviewIncluded(t *testing.T) {
 
 func TestFetch_RequestShape(t *testing.T) {
 	var got http.Request
-	c := newTestClient(t, loadFixture(t, "usage.json"), 200, &got)
+	c := newTestClient(t, testutil.LoadFixture(t, "usage.json"), 200, &got)
 	_, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +199,7 @@ func TestFetch_RequestShape(t *testing.T) {
 	if h := got.Header.Get("Authorization"); h != "Bearer fake-jwt" {
 		t.Errorf("Authorization = %q", h)
 	}
-	if h := got.Header.Get("User-Agent"); !strings.Contains(h, "usage-check") {
+	if h := got.Header.Get("User-Agent"); !strings.Contains(h, "aistat") {
 		t.Errorf("User-Agent missing: %q", h)
 	}
 }
@@ -352,7 +336,7 @@ func TestFetch_NetworkErrorIsTransient(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	srv.Close()
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "codex"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "aistat-test/0", ProviderID: "codex"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 		now:       time.Now,
@@ -369,7 +353,7 @@ func TestFetch_CancelledContextIsNotTransient(t *testing.T) {
 	}))
 	defer srv.Close()
 	c := &Client{
-		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "usage-check-test/0", ProviderID: "codex"},
+		doer:      &httpx.Doer{Client: srv.Client(), UserAgent: "aistat-test/0", ProviderID: "codex"},
 		endpoint:  srv.URL,
 		readToken: func(ctx context.Context) (string, error) { return "tok", nil },
 		now:       time.Now,

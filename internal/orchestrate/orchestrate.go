@@ -8,22 +8,24 @@ import (
 	"sync"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 const retryBackoff = 200 * time.Millisecond
 
 type Options struct {
-	Now   func() time.Time
-	Debug io.Writer
+	Now          func() time.Time
+	Debug        io.Writer
+	RetryBackoff time.Duration // zero defaults to retryBackoff; injectable for tests
 }
 
 type ExitStatus int
 
 const (
-	StatusOK        ExitStatus = 0
-	StatusAnyFailed ExitStatus = 1
+	StatusOK          ExitStatus = 0
+	StatusAnyFailed   ExitStatus = 1
+	StatusRenderError ExitStatus = 3
 )
 
 // Run fetches every requested provider concurrently, retries each once on
@@ -36,6 +38,11 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 	byID := map[string]providers.Provider{}
 	for _, p := range all {
 		byID[p.ID()] = p
+	}
+
+	backoff := opts.RetryBackoff
+	if backoff == 0 {
+		backoff = retryBackoff
 	}
 
 	checkedAt := opts.Now().UTC().Truncate(time.Second)
@@ -57,7 +64,7 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 		wg.Add(1)
 		go func(p providers.Provider) {
 			defer wg.Done()
-			out, err := fetchWithRetry(ctx, p, opts.Debug)
+			out, err := fetchWithRetry(ctx, p, opts.Debug, backoff)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -83,11 +90,11 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 // misclassify as ErrAuthDenied and would need the Classifier signature
 // widened to *http.Response so X-RateLimit-* / Retry-After can inform
 // the decision.
-func fetchWithRetry(ctx context.Context, p providers.Provider, debug io.Writer) (providers.ProviderOutput, error) {
+func fetchWithRetry(ctx context.Context, p providers.Provider, debug io.Writer, backoff time.Duration) (providers.ProviderOutput, error) {
 	out, err := fetchOnce(ctx, p, debug, false)
 	if errors.Is(err, providers.ErrTransient) {
 		select {
-		case <-time.After(retryBackoff):
+		case <-time.After(backoff):
 		case <-ctx.Done():
 			return providers.ProviderOutput{}, ctx.Err()
 		}

@@ -5,14 +5,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/drogers0/llm-usage/internal/httpx"
+	"github.com/drogers0/aistat/internal/httpx"
 )
 
 func TestWrapWarn_PrefixesLines(t *testing.T) {
 	var buf bytes.Buffer
 	wrapWarn(&buf)("copilot: something drifted")
 	got := buf.String()
-	if !strings.HasPrefix(got, "usage-check: copilot: something drifted") {
+	if !strings.HasPrefix(got, "aistat: copilot: something drifted") {
 		t.Fatalf("missing prefix; got %q", got)
 	}
 	if !strings.HasSuffix(got, "\n") {

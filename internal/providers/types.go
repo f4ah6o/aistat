@@ -30,7 +30,7 @@ var KnownProviderIDs = []string{"claude", "codex", "copilot"}
 // ProjectURL is the upstream repository for this binary. Used in the User-Agent
 // (so endpoint owners can identify the client) and as the prefix for
 // IssueTrackerURL.
-const ProjectURL = "https://github.com/drogers0/llm-usage"
+const ProjectURL = "https://github.com/drogers0/aistat"
 
 // IssueTrackerURL is the upstream issue tracker. Cited in provider error
 // messages emitted when an upstream-API shape change is detected, so users
@@ -69,12 +69,16 @@ type Limit struct {
 // MarshalJSON emits the four documented fields in the documented order, with
 // ResetsAt formatted as "+00:00" instead of Go's default "Z" and percent
 // fields rounded to 2 decimal places to suppress float artifacts (e.g. an
-// internal value of 67.339999999 becomes 67.34 on the wire). Provider code
-// keeps raw values in the struct; rounding is purely a JSON-boundary concern.
-// The fields are listed manually rather than via the "type alias + embed"
-// trick because Go's encoding/json does not deduplicate struct fields by
-// JSON tag.
+// internal value of 67.339999999 becomes 67.34 on the wire). A zero ResetsAt
+// is rejected here as a defensive contract guard — every provider must populate
+// the field, and silently emitting "0001-01-01T00:00:00+00:00" would be worse
+// than failing loudly. The fields are listed manually rather than via the
+// "type alias + embed" trick because Go's encoding/json does not deduplicate
+// struct fields by JSON tag.
 func (l Limit) MarshalJSON() ([]byte, error) {
+	if l.ResetsAt.IsZero() {
+		return nil, errors.New("Limit.MarshalJSON: ResetsAt is zero — provider must populate this field")
+	}
 	return json.Marshal(struct {
 		UsedPercent       float64 `json:"used_percent"`
 		RemainingPercent  float64 `json:"remaining_percent"`

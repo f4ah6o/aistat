@@ -63,15 +63,22 @@ func TestLimitMarshalJSON_FieldOrder(t *testing.T) {
 }
 
 func TestLimitMarshalJSON_WholeNumberHasNoDecimal(t *testing.T) {
-	l := Limit{UsedPercent: 2.0}
+	l := Limit{UsedPercent: 2.0, ResetsAt: time.Unix(1, 0)}
 	b, _ := json.Marshal(l)
 	if !strings.Contains(string(b), `"used_percent":2,`) {
 		t.Fatalf("expected used_percent:2 (no .0), got %s", string(b))
 	}
 }
 
+func TestLimitMarshalJSON_RejectsZeroResetsAt(t *testing.T) {
+	_, err := json.Marshal(Limit{UsedPercent: 50, RemainingPercent: 50, ResetAfterSeconds: 100})
+	if err == nil || !strings.Contains(err.Error(), "ResetsAt") {
+		t.Fatalf("expected ResetsAt error, got %v", err)
+	}
+}
+
 func TestLimitMarshalJSON_RoundsFloatArtifact(t *testing.T) {
-	l := Limit{UsedPercent: 67.339999999, RemainingPercent: 32.660000001}
+	l := Limit{UsedPercent: 67.339999999, RemainingPercent: 32.660000001, ResetsAt: time.Unix(1, 0)}
 	b, _ := json.Marshal(l)
 	s := string(b)
 	if !strings.Contains(s, `"used_percent":67.34`) {

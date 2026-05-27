@@ -5,7 +5,7 @@ package main
 import (
 	"flag"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 func registerFakeMode(_ *flag.FlagSet) func() []providers.Provider { return nil }

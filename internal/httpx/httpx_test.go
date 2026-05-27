@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 func newDoer(t *testing.T, client *http.Client) *Doer {
 	t.Helper()
 	return &Doer{
 		Client:     client,
-		UserAgent:  "usage-check-test/0",
+		UserAgent:  "aistat-test/0",
 		ProviderID: "test",
 	}
 }
@@ -52,7 +52,7 @@ func TestDoerLog_SanitizesNewlines(t *testing.T) {
 	d := newDoer(t, srv.Client())
 	d.Debug = &buf
 	var dst any
-	_ = d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	_ = d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	out := buf.String()
 	if got := strings.Count(out, "\n"); got != 1 {
 		t.Errorf("expected exactly one newline in debug output, got %d:\n%s", got, out)
@@ -69,7 +69,7 @@ func TestGetJSON_OKUnmarshals(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var got struct{ Foo int }
-	if err := d.GetJSON(context.Background(), srv.URL, "tok", &got, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &got, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	if got.Foo != 42 {
@@ -86,13 +86,13 @@ func TestGetJSON_BearerAndUAHeadersSet(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	if err := d.GetJSON(context.Background(), srv.URL, "tok-x", &dst, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL, "tok-x", 10*time.Second, &dst, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	if captured.Get("Authorization") != "Bearer tok-x" {
 		t.Errorf("Authorization wrong: %q", captured.Get("Authorization"))
 	}
-	if captured.Get("User-Agent") != "usage-check-test/0" {
+	if captured.Get("User-Agent") != "aistat-test/0" {
 		t.Errorf("User-Agent wrong: %q", captured.Get("User-Agent"))
 	}
 	if captured.Get("Accept") != "application/json" {
@@ -115,13 +115,13 @@ func TestGetJSON_ExtraHeadersDoesNotOverrideReserved(t *testing.T) {
 		"Accept":        "application/vnd.github+json",
 	}
 	var dst struct{}
-	if err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	if got := captured.Get("Authorization"); got != "Bearer tok" {
 		t.Errorf("Authorization should be untouched, got %q", got)
 	}
-	if got := captured.Get("User-Agent"); got != "usage-check-test/0" {
+	if got := captured.Get("User-Agent"); got != "aistat-test/0" {
 		t.Errorf("User-Agent should be untouched, got %q", got)
 	}
 	if got := captured.Get("Accept"); got != "application/vnd.github+json" {
@@ -142,7 +142,7 @@ func TestGetJSON_ExtraHeadersOverrideDefault(t *testing.T) {
 		"Anthropic-Beta": "oauth-2025-04-20",
 	}
 	var dst struct{}
-	if err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	if captured.Get("Accept") != "application/vnd.github+json" {
@@ -161,7 +161,7 @@ func TestGetJSON_401IsAuthDenied(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if !errors.Is(err, providers.ErrAuthDenied) {
 		t.Errorf("expected ErrAuthDenied, got: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestGetJSON_503IsTransient(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if !errors.Is(err, providers.ErrTransient) {
 		t.Errorf("expected ErrTransient, got: %v", err)
 	}
@@ -191,7 +191,7 @@ func TestGetJSON_418IsBareError(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if errors.Is(err, providers.ErrTransient) || errors.Is(err, providers.ErrAuthDenied) {
 		t.Errorf("418 should be bare error, got: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestGetJSON_NetworkErrorIsTransient(t *testing.T) {
 	srv.Close() // shut down before any request
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if !errors.Is(err, providers.ErrTransient) {
 		t.Errorf("network error should be transient: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestGetJSON_ContextCanceledNotTransient(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var dst struct{}
-	err := d.GetJSON(ctx, srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(ctx, srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if errors.Is(err, providers.ErrTransient) {
 		t.Errorf("cancelled ctx should not be transient: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestGetJSON_NonJSONOnSuccess(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{ Foo int }
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if err == nil || !strings.Contains(err.Error(), "non-JSON response from") {
 		t.Errorf("expected non-JSON error, got: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestGetJSON_DebugLogs(t *testing.T) {
 	d.Debug = &buf
 	d.ProviderID = "claude"
 	var dst struct{}
-	if err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
@@ -293,7 +293,7 @@ func TestGetJSON_RedirectLogsFinalURL(t *testing.T) {
 	d.Debug = &buf
 	d.ProviderID = "test"
 	var dst struct{}
-	if err := d.GetJSON(context.Background(), srv.URL+"/a", "tok", &dst, DefaultClassify); err != nil {
+	if err := d.GetJSON(context.Background(), srv.URL+"/a", "tok", 10*time.Second, &dst, DefaultClassify); err != nil {
 		t.Fatal(err)
 	}
 	if captured != "/b" {
@@ -322,7 +322,7 @@ func TestGetJSON_PartialReadDuringCancel(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{ Foo int }
-	err := d.GetJSON(ctx, srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(ctx, srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if err == nil {
 		t.Fatal("expected error after cancel")
 	}
@@ -342,7 +342,7 @@ func TestGetJSON_BodyTooLarge(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{ Foo int }
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if err == nil {
 		t.Fatal("expected error for oversized body")
 	}
@@ -372,7 +372,7 @@ func TestGetJSON_OversizedNon200StillClassified(t *testing.T) {
 	defer srv.Close()
 	d := newDoer(t, srv.Client())
 	var dst struct{}
-	err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify)
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
 	if !errors.Is(err, providers.ErrAuthDenied) {
 		t.Errorf("oversized 401 must classify as ErrAuthDenied, got: %v", err)
 	}
@@ -428,6 +428,102 @@ func TestDefaultClassify(t *testing.T) {
 		if !strings.Contains(err.Error(), "body") {
 			t.Errorf("status %d: error should include body snippet, got %v", c.status, err)
 		}
+	}
+}
+
+func TestGetJSON_ChildDeadlineWrappedTransient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	d := newDoer(t, srv.Client())
+	var dst struct{}
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 50*time.Millisecond, &dst, DefaultClassify)
+	if !errors.Is(err, providers.ErrTransient) {
+		t.Errorf("child-only deadline must wrap as ErrTransient, got: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error chain must preserve context.DeadlineExceeded, got: %v", err)
+	}
+}
+
+func TestGetJSON_ParentCancellationStaysBare(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Second)
+	}))
+	defer srv.Close()
+	d := newDoer(t, srv.Client())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var dst struct{}
+	err := d.GetJSON(ctx, srv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
+	if errors.Is(err, providers.ErrTransient) {
+		t.Errorf("parent cancellation must NOT wrap as ErrTransient, got: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled, got: %v", err)
+	}
+}
+
+func TestGetJSON_ChildDeadlineDuringReadWrappedTransient(t *testing.T) {
+	// Server sends headers + partial body, then stalls past the per-call
+	// timeout so the child ctx expires during ReadAll. Parent ctx stays alive.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"foo":`))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		time.Sleep(300 * time.Millisecond)
+	}))
+	defer srv.Close()
+	d := newDoer(t, srv.Client())
+	var dst struct{ Foo int }
+	err := d.GetJSON(context.Background(), srv.URL, "tok", 50*time.Millisecond, &dst, DefaultClassify)
+	if err == nil {
+		t.Fatal("expected error from child deadline during ReadAll")
+	}
+	if !errors.Is(err, providers.ErrTransient) {
+		t.Errorf("child deadline during read must wrap as ErrTransient, got: %v", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error chain must preserve context.DeadlineExceeded, got: %v", err)
+	}
+}
+
+func TestGetJSON_SchemeDowngradeRejected(t *testing.T) {
+	// Downgrade target: plain HTTP. Capture whether it was ever hit.
+	var downgradeHit bool
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downgradeHit = true
+		w.Write([]byte(`{}`))
+	}))
+	defer plain.Close()
+
+	// Origin: HTTPS, issues a 302 to the plain HTTP target.
+	tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL, http.StatusFound)
+	}))
+	defer tlsSrv.Close()
+
+	// Build a Doer whose Client trusts the TLS server's cert (via the server's
+	// own Client) but has our RejectSchemeDowngrade policy installed.
+	client := tlsSrv.Client()
+	client.CheckRedirect = RejectSchemeDowngrade
+	d := newDoer(t, client)
+
+	var dst struct{}
+	err := d.GetJSON(context.Background(), tlsSrv.URL, "tok", 10*time.Second, &dst, DefaultClassify)
+	if err == nil {
+		t.Fatal("expected scheme-downgrade error")
+	}
+	if !strings.Contains(err.Error(), "scheme downgrade") {
+		t.Errorf("expected error mentioning 'scheme downgrade', got: %v", err)
+	}
+	if downgradeHit {
+		t.Errorf("downgrade target must NOT have been reached")
 	}
 }
 

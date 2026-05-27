@@ -1,9 +1,9 @@
-# usage-check
+# aistat
 
 A single static **Go binary** that reports your Claude, Codex, and Copilot usage from the terminal.
 
 ```
-$ usage-check -h
+$ aistat -h
 Claude usage
 - 5-hour: 6.0% (resets in 4h 48m)
 - 7-day: 42.0% (resets in 48m)
@@ -12,6 +12,7 @@ Claude usage
 Codex usage
 - 5-hour: 2.0% (resets in 2h 26m)
 - 7-day: 0.0% (resets in 6d 21h)
+- Code review 7-day: 0.0% (resets in 6d 21h)  # appears only with recent code-review activity
 
 Copilot usage
 - month: 67.3% (resets in 5d 1h)
@@ -21,12 +22,12 @@ JSON is the default; `-h`/`--human` opts into the text rendering above.
 
 ## Install
 
-Prebuilt binaries are available on the [Releases page](https://github.com/drogers0/llm-usage/releases).
+Prebuilt binaries are available on the [Releases page](https://github.com/drogers0/aistat/releases).
 
 For Go users, install from source:
 
 ```
-go install github.com/drogers0/llm-usage/cmd/usage-check@latest
+go install github.com/drogers0/aistat/cmd/aistat@latest
 ```
 
 Requires Go 1.22+. Claude, Codex, and Copilot all work on macOS and Linux. The Claude provider reads from the macOS Keychain item populated by `claude /login`, or from `~/.claude/.credentials.json` on Linux.
@@ -34,15 +35,15 @@ Requires Go 1.22+. Claude, Codex, and Copilot all work on macOS and Linux. The C
 ## Usage
 
 ```
-usage-check                # all services, JSON
-usage-check claude         # claude only, JSON
-usage-check codex          # codex only, JSON
-usage-check copilot        # copilot only, JSON
-usage-check -h             # all services, human-readable text
-usage-check claude -h      # claude only, human-readable
-usage-check --debug        # one line per HTTP request + per-provider summary, to stderr
-usage-check --version      # print version and exit
-usage-check --help         # print help
+aistat                # all services, JSON
+aistat claude         # claude only, JSON
+aistat codex          # codex only, JSON
+aistat copilot        # copilot only, JSON
+aistat -h             # all services, human-readable text
+aistat claude -h      # claude only, human-readable
+aistat --debug        # one line per HTTP request + per-provider summary, to stderr
+aistat --version      # print version and exit
+aistat --help         # print help
 ```
 
 `-h` is the short form of `--human` (the text renderer). Help is `--help` only.
@@ -64,16 +65,17 @@ Providers are fetched in parallel. A failing provider does not block the others;
 | Code | Meaning |
 |------|---------|
 | 0 | All requested providers succeeded. |
-| 1 | One or more requested providers failed at runtime (transient HTTP, missing credentials, renderer error). |
+| 1 | One or more requested providers failed at runtime (transient HTTP, missing credentials). |
 | 2 | Usage / contract error: unknown provider name, malformed flags, trailing positional argument, or a requested provider is not built into this binary. |
+| 3 | Stdout write error (broken pipe, disk full). |
 
 ## Diagnostics on stderr
 
 Even without `--debug`, the Copilot provider may emit one diagnostic line to stderr when it detects an API drift signal:
 
-    usage-check: copilot: Copilot-product usageItems present but none matched
+    aistat: copilot: Copilot-product usageItems present but none matched
     sku="Copilot Premium Request" — GitHub may have renamed the SKU; please
-    file an issue at https://github.com/drogers0/llm-usage/issues
+    file an issue at https://github.com/drogers0/aistat/issues
 
 The exit code and stdout payload are unaffected — this is a heads-up that the underlying number may be stale. With `--debug`, additional per-request and per-provider lines are also written to stderr.
 
@@ -85,7 +87,7 @@ If a provider's credential is missing, the error message names the exact command
 gh auth refresh -h github.com -s user
 ```
 
-If GitHub returns a Copilot plan slug `usage-check` doesn't recognize, the provider fails closed with a message naming the slug and a link to file an issue.
+If GitHub returns a Copilot plan slug `aistat` doesn't recognize, the provider fails closed with a message naming the slug and a link to file an issue.
 
 ## Output contract
 
@@ -101,11 +103,6 @@ If GitHub returns a Copilot plan slug `usage-check` doesn't recognize, the provi
 ```
 
 Every `Limit` has the same four fields: `used_percent`, `remaining_percent`, `resets_at` (ISO 8601, always `+00:00` for UTC, never `Z`), `reset_after_seconds`. The top-level `providers` map is alphabetically sorted.
-
-## v2 breaking changes (from v1.0.0)
-
-- **JSON is now the default.** `-h`/`--human` opts into text. The old `--json` flag is removed (use bare `usage-check`).
-- **Distribution:** Go binary via `go install`. The TypeScript + Chrome extension + native messaging host architecture is gone; the v1 sources are preserved at the [`v1.0.0` tag](https://github.com/drogers0/llm-usage/releases/tag/v1.0.0) and the `legacy/typescript-chrome-extension` branch.
 
 ## License
 

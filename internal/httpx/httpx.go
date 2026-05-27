@@ -1,4 +1,4 @@
-// Package httpx provides a shared HTTP client wrapper for usage-check providers.
+// Package httpx provides a shared HTTP client wrapper for aistat providers.
 // It owns request setup (Bearer auth, User-Agent, Accept), execution, body read,
 // status classification, JSON unmarshal, and optional per-request debug logging.
 package httpx
@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/drogers0/llm-usage/internal/providers"
+	"github.com/drogers0/aistat/internal/providers"
 )
 
 // Doer is a thin wrapper around *http.Client that provides the request/response
@@ -32,12 +32,10 @@ import (
 // ExtraHeaders must not be mutated after construction; it is read by GetJSON
 // concurrently with other requests sharing the same Doer.
 //
-// Redirect behavior is net/http's default (≤10 redirects; stdlib strips
-// Authorization on cross-host redirects). Same-host redirects and scheme
-// downgrades are followed; none of the current endpoints issue redirects.
-// A strict CheckRedirect would risk breaking on future legitimate provider
-// changes (regional routing, version transitions); revisit if a provider
-// starts redirecting.
+// Redirect behavior: stdlib follows up to 10 redirects and strips Authorization
+// across host changes; RejectSchemeDowngrade (installed by every provider's
+// New) additionally aborts HTTPS→HTTP downgrades to prevent bearer-token
+// cleartext leakage. Same-scheme same-host redirects are followed.
 type Doer struct {
 	Client       *http.Client
 	UserAgent    string
@@ -58,11 +56,46 @@ const maxBodyBytes = 1 << 20
 // can identify which endpoint actually responded.
 type Classifier func(url string, status int, body []byte) error
 
+// NewDoer constructs a Doer with the required Client validated non-nil
+// (programmer error → panic). Production code should prefer this over Doer
+// literals so partial-init bugs become construction-time panics.
+func NewDoer(client *http.Client, userAgent, providerID string, extraHeaders map[string]string, debug io.Writer) *Doer {
+	if client == nil {
+		panic("httpx.NewDoer: client must not be nil")
+	}
+	return &Doer{
+		Client:       client,
+		UserAgent:    userAgent,
+		ProviderID:   providerID,
+		ExtraHeaders: extraHeaders,
+		Debug:        debug,
+	}
+}
+
+// RejectSchemeDowngrade is an http.Client CheckRedirect policy that aborts
+// HTTPS→HTTP redirects to prevent bearer-token cleartext leakage. Initial
+// requests (len(via)==0) and HTTP→HTTPS upgrades are permitted; cross-host
+// redirects independently strip Authorization per stdlib. Permitting the
+// initial HTTP scheme keeps httptest.NewServer-backed tests working.
+func RejectSchemeDowngrade(req *http.Request, via []*http.Request) error {
+	if len(via) == 0 {
+		return nil
+	}
+	prev := via[len(via)-1]
+	if prev.URL.Scheme == "https" && req.URL.Scheme == "http" {
+		return fmt.Errorf("refusing HTTPS→HTTP scheme downgrade from %s to %s", prev.URL.Host, req.URL.Host)
+	}
+	return nil
+}
+
 // GetJSON performs GET url with Bearer auth, runs classify on non-200, and
-// unmarshals a 200 body into dst. Cancellation precedence: if ctx is already
-// cancelled or cancels mid-read, ctx.Err() wins over any non-200 or non-JSON
-// error that would otherwise be returned.
-func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify Classifier) error {
+// unmarshals a 200 body into dst. timeout is the per-call deadline derived
+// inside GetJSON from parentCtx — callers pass their parent ctx unchanged so
+// GetJSON can distinguish parent cancellation (bare context error) from a
+// child-only deadline (wrapped as ErrTransient so the orchestrator retries).
+func (d *Doer) GetJSON(parentCtx context.Context, url, token string, timeout time.Duration, dst any, classify Classifier) error {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -85,9 +118,15 @@ func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify
 	if doErr != nil {
 		d.log(url, doErr.Error(), elapsed)
 		if errors.Is(doErr, context.Canceled) || errors.Is(doErr, context.DeadlineExceeded) {
-			return doErr
+			// Parent cancelled/timed out → bare ctx error (real cancellation semantics).
+			// Child-only deadline (parent alive) → ErrTransient so the orchestrator's
+			// one retry runs against a fresh per-call budget.
+			if parentCtx.Err() != nil {
+				return doErr
+			}
+			return fmt.Errorf("%w: %w", providers.ErrTransient, doErr)
 		}
-		return fmt.Errorf("%w: %s", providers.ErrTransient, doErr.Error())
+		return fmt.Errorf("%w: %w", providers.ErrTransient, doErr)
 	}
 	defer resp.Body.Close()
 
@@ -101,10 +140,13 @@ func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if readErr != nil {
 		d.log(finalURL, readErr.Error(), elapsed)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
+		if parentCtx.Err() != nil {
+			return parentCtx.Err()
 		}
-		return fmt.Errorf("%w: reading response body from %s: %s", providers.ErrTransient, finalURL, readErr.Error())
+		if ctx.Err() != nil {
+			return fmt.Errorf("%w: %w", providers.ErrTransient, ctx.Err())
+		}
+		return fmt.Errorf("%w: reading response body from %s: %w", providers.ErrTransient, finalURL, readErr)
 	}
 	// Status classification runs before the size guard so an oversized error
 	// page (e.g. a 401 returning a 2 MiB HTML page from a misconfigured
@@ -164,12 +206,14 @@ func Snip(b []byte) string {
 // non-200 responses. Providers wanting an overlay (e.g. Copilot's
 // 404 → ErrAuthMissing) wrap this with their own pre-check.
 //
-// All 403 responses classify as ErrAuthDenied. GitHub returns 403 for
-// primary/secondary rate-limit and abuse-detection responses, which this
-// misclassifies as auth failures. Accepted because the orchestrator does
-// not retry on ErrTransient. If a retry policy is added, this Classifier
-// signature must widen to receive *http.Response so X-RateLimit-* /
-// Retry-After headers can inform classification.
+// All 403s classify as ErrAuthDenied. GitHub returns 403 for rate-limit /
+// abuse-detection too, mislabelled here as auth failure. Accepted:
+// aistat is on-demand (one request per provider per invocation);
+// rate-limiting from this binary is rare, and surfacing the misclassification
+// as a clear auth error beats silent retries into the same wall. If
+// aistat becomes a polling daemon or batches multiple requests, widen
+// this Classifier signature to *http.Response so X-RateLimit-* / Retry-After
+// headers can inform classification.
 func DefaultClassify(url string, status int, body []byte) error {
 	switch {
 	case status == 401 || status == 403:

@@ -17,11 +17,11 @@ import (
 // cancellable I/O.
 //
 // File permissions are the Claude Code CLI's responsibility (it created the
-// file); usage-check is a read-only observer and does not police them.
+// file); aistat is a read-only observer and does not police them.
 func ReadClaudeToken(ctx context.Context) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("%w: cannot resolve home directory ($HOME unset): %s", ErrClaudeTokenNotFound, err.Error())
+		return "", fmt.Errorf("%w: cannot resolve home directory ($HOME unset): %w", ErrClaudeTokenNotFound, err)
 	}
 	path := filepath.Join(home, ".claude", ".credentials.json")
 	data, err := os.ReadFile(path)
