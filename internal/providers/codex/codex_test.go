@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -71,11 +72,23 @@ func TestFetch_GoldenFixture_TwoWindows(t *testing.T) {
 	}
 }
 
-// TestFetch_EmittedKeysMatchKnownWindows is a tripwire: if Fetch adds or
-// removes a window key, KnownWindows must stay in sync. The render-side
-// label table is policed separately by internal/render/tripwire_test.go.
+// TestFetch_EmittedKeysMatchKnownWindows is a tripwire: if Fetch's emitted
+// key set and KnownWindows disagree, this test fails. The fixture is built
+// programmatically from KnownWindows (via buildResponseForKeys), so a
+// developer who adds a window to KnownWindows without extending the builder
+// will trip the builder's switch-default at runtime.
+//
+// Limitation: this test does NOT catch the scenario where a developer adds
+// a window to Fetch without updating KnownWindows — the dynamic fixture
+// only carries KnownWindows keys, so an unknown key would have no source
+// data to extract. Closing that gap would require Fetch itself to iterate
+// KnownWindows; the current code uses inline string literals per the
+// asymmetric response shape (each window lives in a different response
+// field). The render-side label table is policed separately by
+// internal/render/tripwire_test.go.
 func TestFetch_EmittedKeysMatchKnownWindows(t *testing.T) {
-	c := newTestClient(t, loadFixture(t, "usage_with_code_review.json"), 200, nil)
+	body := buildResponseForKeys(t, KnownWindows)
+	c := newTestClient(t, body, 200, nil)
 	out, err := c.Fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -95,9 +108,57 @@ func TestFetch_EmittedKeysMatchKnownWindows(t *testing.T) {
 	}
 	for k := range known {
 		if !emitted[k] {
-			t.Errorf("KnownWindows lists %q but Fetch did not emit it (fixture has all three)", k)
+			t.Errorf("KnownWindows lists %q but Fetch did not emit it", k)
 		}
 	}
+}
+
+// buildResponseForKeys constructs Codex's usage-response JSON populated
+// with exactly the windows in `keys`. Uses the same-package response /
+// window struct literals so a Go field-name rename in those types breaks
+// this builder at compile time rather than silently producing a marshalled
+// JSON the runtime would ignore. A JSON-tag-only rename would still slip
+// through — the shape-drift assertions in Fetch are the backstop there.
+func buildResponseForKeys(t *testing.T, keys []string) []byte {
+	t.Helper()
+	now := time.Now().Unix()
+	resp := response{}
+	rate := &struct {
+		PrimaryWindow   *window `json:"primary_window"`
+		SecondaryWindow *window `json:"secondary_window"`
+	}{}
+	for _, k := range keys {
+		switch k {
+		case "five_hour":
+			rate.PrimaryWindow = &window{
+				UsedPercent:        1.0,
+				LimitWindowSeconds: primaryWindowSeconds,
+				ResetAt:            now + 3600,
+			}
+		case "seven_day":
+			rate.SecondaryWindow = &window{
+				UsedPercent:        0.5,
+				LimitWindowSeconds: secondaryWindowSeconds,
+				ResetAt:            now + 86400,
+			}
+		case "code_review_seven_day":
+			resp.CodeReviewRateLimit = &window{
+				UsedPercent: 2.0,
+				// limit_window_seconds intentionally unasserted by Fetch.
+				ResetAt: now + 86400,
+			}
+		default:
+			t.Fatalf("buildResponseForKeys: KnownWindows contains %q with no extractor in this builder — extend buildResponseForKeys when adding a window", k)
+		}
+	}
+	if rate.PrimaryWindow != nil || rate.SecondaryWindow != nil {
+		resp.RateLimit = rate
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestFetch_CodeReviewIncluded(t *testing.T) {

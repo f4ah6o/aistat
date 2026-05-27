@@ -44,6 +44,7 @@ type Client struct {
 	userURL   string
 	usageURL  func(login string, year int, month int) string
 	warn      func(string)
+	now       func() time.Time
 }
 
 // Option mutates a Client at construction time.
@@ -56,6 +57,11 @@ type Option func(*Client)
 // The callback may be invoked from the Fetch goroutine; if the caller's
 // closure touches shared state, the caller is responsible for synchronization.
 func WithWarn(fn func(string)) Option { return func(c *Client) { c.warn = fn } }
+
+// WithNow overrides the clock-of-record used to compute ResetAfterSeconds
+// and the year/month for the billing URL. Defaults to time.Now. Intended for
+// tests; production callers should not override.
+func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn } }
 
 func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	c := &Client{
@@ -71,6 +77,7 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 		usageURL: func(login string, year int, month int) string {
 			return fmt.Sprintf(usageEndpointTmpl, login, year, month)
 		},
+		now: time.Now,
 	}
 	for _, o := range opts {
 		o(c)
@@ -111,9 +118,11 @@ type usageResp struct {
 }
 
 // classifyCopilot adds GitHub's missing-scope tripwire on top of DefaultClassify.
-// GitHub returns 404 with `{"message":"Not Found",...}` when the token lacks the
-// `user` scope on the billing endpoint; the preceding /user call already proved
-// the token works, so 404 here is not "user does not exist" in practice.
+// GitHub returns 404 with `{"message":"Not Found",...}` from the billing
+// endpoint when the token lacks the `user` scope. Install this classifier
+// ONLY on the billing call — the /user call must use DefaultClassify so that
+// a transient 404 from /user (during GitHub outages or endpoint deprecation)
+// is not mis-surfaced as "missing scope".
 func classifyCopilot(url string, status int, body []byte) error {
 	if status == 404 && strings.Contains(string(body), "Not Found") {
 		return fmt.Errorf("%w: %s", providers.ErrAuthMissing, cred.GitHubTokenMissingMessage)
@@ -135,7 +144,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	}
 
 	var user userResp
-	if err := c.doer.GetJSON(ctx, c.userURL, token, &user, classifyCopilot); err != nil {
+	if err := c.doer.GetJSON(ctx, c.userURL, token, &user, httpx.DefaultClassify); err != nil {
 		return providers.ProviderOutput{}, err
 	}
 	if user.Login == "" {
@@ -153,7 +162,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	// See claude.go: this `now` and main's checked_at are computed from
 	// separate time.Now() calls, so reset_after_seconds + checked_at may
 	// differ from resets_at by up to one second.
-	now := time.Now().UTC()
+	now := c.now().UTC().Truncate(time.Second)
 
 	var usage usageResp
 	if err := c.doer.GetJSON(ctx, c.usageURL(user.Login, now.Year(), int(now.Month())), token, &usage, classifyCopilot); err != nil {

@@ -40,8 +40,9 @@ type Doer struct {
 
 // maxBodyBytes caps the response body size GetJSON will read. Real provider
 // payloads are well under 100 KB; 1 MiB is defensive headroom. Over-limit
-// bodies are returned as a plain error (no ErrTransient wrap — see D7 in
-// REVIEW_RESOLUTION_PLAN.md): they don't resolve in a 200 ms retry.
+// bodies are returned as a plain error (NOT wrapped in ErrTransient):
+// retrying won't shrink a body, so the retry would burn another budget for
+// no benefit.
 const maxBodyBytes = 1 << 20
 
 // Classifier maps a non-200 response to a provider-specific error. The url is
@@ -101,7 +102,7 @@ func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify
 	// page (e.g. a 401 returning a 2 MiB HTML page from a misconfigured
 	// proxy) still surfaces as ErrAuthDenied/ErrTransient. The classifier's
 	// body argument is capped at maxBodyBytes+1; Snip truncates further.
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		d.log(finalURL, fmt.Sprintf("HTTP %d", resp.StatusCode), elapsed)
 		return classify(finalURL, resp.StatusCode, body)
 	}

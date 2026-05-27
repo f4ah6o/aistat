@@ -286,6 +286,27 @@ func TestFetch_NonCopilotItemsFiltered(t *testing.T) {
 	}
 }
 
+func TestFetch_UserEndpoint404IsNotMisclassified(t *testing.T) {
+	// A 404 from /user must NOT be classified as "missing user scope" — the
+	// scope-missing tripwire is specific to the billing endpoint. A /user
+	// 404 (rare; happens during partial GitHub outages or endpoint
+	// deprecation) should surface as a bare HTTP 404 error.
+	c, _ := newRoutedClient(t, []byte(`{"message":"Not Found"}`), loadFixture(t, "usage.json"), 404, 200)
+	_, err := c.Fetch(context.Background())
+	if err == nil {
+		t.Fatal("expected error on /user 404")
+	}
+	if errors.Is(err, providers.ErrAuthMissing) {
+		t.Errorf("/user 404 must NOT be classified as ErrAuthMissing; got: %v", err)
+	}
+	if strings.Contains(err.Error(), cred.GitHubTokenMissingMessage) {
+		t.Errorf("/user 404 must NOT surface the missing-scope message; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "HTTP 404") {
+		t.Errorf("error should mention HTTP 404; got: %v", err)
+	}
+}
+
 func TestFetch_404MissingScope(t *testing.T) {
 	body := []byte(`{"message":"Not Found","documentation_url":"...","status":"404"}`)
 	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), body, 200, 404)
@@ -411,6 +432,26 @@ func TestFetch_EmptyLogin(t *testing.T) {
 	_, err := c.Fetch(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "empty login") {
 		t.Errorf("expected empty-login error, got: %v", err)
+	}
+}
+
+func TestFetch_ResetAfterSecondsTruncated(t *testing.T) {
+	// Frozen clock with a non-zero sub-second component. Without truncation,
+	// the 789ms residue shaves a second off ResetAfterSeconds via int(...)
+	// rounding toward zero; with truncation, it does not.
+	frozen := time.Date(2026, 5, 15, 12, 34, 56, 789_000_000, time.UTC)
+	c, _ := newRoutedClient(t, loadFixture(t, "user.json"), loadFixture(t, "usage.json"), 200, 200,
+		WithNow(func() time.Time { return frozen }),
+	)
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nowTrunc := frozen.Truncate(time.Second)
+	reset := time.Date(nowTrunc.Year(), nowTrunc.Month()+1, 1, 0, 0, 0, 0, time.UTC)
+	want := int(reset.Sub(nowTrunc).Seconds())
+	if got := out.Limits["month"].ResetAfterSeconds; got != want {
+		t.Errorf("ResetAfterSeconds = %d, want %d (truncation regression: removing .Truncate(time.Second) in Fetch yields want-1)", got, want)
 	}
 }
 
