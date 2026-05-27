@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/drogers0/llm-usage/internal/httpx"
 	"github.com/drogers0/llm-usage/internal/providers"
 	"github.com/drogers0/llm-usage/internal/providers/claude"
 	"github.com/drogers0/llm-usage/internal/providers/codex"
@@ -15,7 +16,7 @@ import (
 // (per-Doer debug, orchestrator per-provider summary, Copilot warn), so
 // all three serialize through one mutex. includeDebug toggles per-request
 // debug logging — when false, Doers receive a nil Debug writer.
-func realProviders(safeStderr io.Writer, includeDebug bool) []providers.Provider {
+func realProviders(safeStderr *httpx.ConcurrencySafeWriter, includeDebug bool) []providers.Provider {
 	var debugSink io.Writer
 	if includeDebug {
 		debugSink = safeStderr
@@ -35,7 +36,7 @@ func realProviders(safeStderr io.Writer, includeDebug bool) []providers.Provider
 // provide a non-CLI seam for tests that exercise warn-wiring against the
 // real provider construction.
 func buildProviders(
-	safeStderr io.Writer,
+	safeStderr *httpx.ConcurrencySafeWriter,
 	includeDebug bool,
 	fakeFn func() []providers.Provider,
 	requested []string,
