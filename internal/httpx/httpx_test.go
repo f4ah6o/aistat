@@ -62,6 +62,35 @@ func TestGetJSON_BearerAndUAHeadersSet(t *testing.T) {
 	}
 }
 
+func TestGetJSON_ExtraHeadersDoesNotOverrideReserved(t *testing.T) {
+	var captured http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Clone()
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	d := newDoer(t, srv.Client())
+	d.ExtraHeaders = map[string]string{
+		"Authorization": "Bearer EVIL",
+		"User-Agent":    "evil/0",
+		"authorization": "Bearer EVIL-lower",
+		"Accept":        "application/vnd.github+json",
+	}
+	var dst struct{}
+	if err := d.GetJSON(context.Background(), srv.URL, "tok", &dst, DefaultClassify); err != nil {
+		t.Fatal(err)
+	}
+	if got := captured.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("Authorization should be untouched, got %q", got)
+	}
+	if got := captured.Get("User-Agent"); got != "usage-check-test/0" {
+		t.Errorf("User-Agent should be untouched, got %q", got)
+	}
+	if got := captured.Get("Accept"); got != "application/vnd.github+json" {
+		t.Errorf("non-reserved key should still apply; Accept = %q", got)
+	}
+}
+
 func TestGetJSON_ExtraHeadersOverrideDefault(t *testing.T) {
 	var captured http.Header
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

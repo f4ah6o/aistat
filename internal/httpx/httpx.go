@@ -19,9 +19,12 @@ import (
 // Doer is a thin wrapper around *http.Client that provides the request/response
 // pipeline shared by every provider. Header application order: Authorization
 // and User-Agent are set first, then a default `Accept: application/json`, then
-// ExtraHeaders are applied last and OVERRIDE the defaults. Providers needing a
-// non-JSON Accept (e.g. Copilot's `application/vnd.github+json`) supply it via
-// ExtraHeaders. A future endpoint on the same Doer that needs a different
+// ExtraHeaders are applied last and override remaining defaults. Authorization
+// and User-Agent are reserved — entries in ExtraHeaders for those keys
+// (canonical or otherwise) are silently dropped so a misconfigured provider
+// cannot accidentally clobber the bearer token or user-agent. Providers needing
+// a non-JSON Accept (e.g. Copilot's `application/vnd.github+json`) supply it
+// via ExtraHeaders. A future endpoint on the same Doer that needs a different
 // Accept must use a per-request header instead — this Doer cannot
 // differentiate by URL. Acceptable today since each provider has its own Doer.
 //
@@ -60,7 +63,11 @@ func (d *Doer) GetJSON(ctx context.Context, url, token string, dst any, classify
 	req.Header.Set("User-Agent", d.UserAgent)
 	req.Header.Set("Accept", "application/json")
 	for k, v := range d.ExtraHeaders {
-		req.Header.Set(k, v)
+		canon := http.CanonicalHeaderKey(k)
+		if canon == "Authorization" || canon == "User-Agent" {
+			continue
+		}
+		req.Header.Set(canon, v)
 	}
 
 	resp, doErr := d.Client.Do(req)
