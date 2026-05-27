@@ -107,7 +107,35 @@ func TestFetch_GoldenFlow_Pro(t *testing.T) {
 	}
 }
 
-func TestFetch_UnknownPlanFallsBackAndWarns(t *testing.T) {
+func TestFetch_UnknownPlanIsFailClosed(t *testing.T) {
+	var warnings []string
+	c, rec := newRoutedClient(t,
+		loadFixture(t, "user_unknown_plan.json"),
+		loadFixture(t, "usage.json"),
+		200, 200,
+		WithWarn(func(s string) { warnings = append(warnings, s) }),
+	)
+	_, err := c.Fetch(context.Background())
+	if err == nil {
+		t.Fatal("expected error for unknown plan")
+	}
+	if !strings.Contains(err.Error(), "future_tier") {
+		t.Errorf("error should name unknown plan slug, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), providers.IssueTrackerURL) {
+		t.Errorf("error should include issue-tracker URL %q, got: %v", providers.IssueTrackerURL, err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warn channel is reserved for SKU drift; got unknown-plan warnings: %v", warnings)
+	}
+	// Fail-closed must short-circuit before the usage call so we don't burn
+	// a second request against the upstream rate limit for data we'll discard.
+	if len(rec.reqs) != 1 {
+		t.Errorf("unknown plan must short-circuit before the usage call; got %d requests", len(rec.reqs))
+	}
+}
+
+func TestFetch_UnknownPlanDoesNotInvokeWarn(t *testing.T) {
 	var warnings []string
 	c, _ := newRoutedClient(t,
 		loadFixture(t, "user_unknown_plan.json"),
@@ -115,23 +143,9 @@ func TestFetch_UnknownPlanFallsBackAndWarns(t *testing.T) {
 		200, 200,
 		WithWarn(func(s string) { warnings = append(warnings, s) }),
 	)
-	out, err := c.Fetch(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(warnings) != 1 {
-		t.Fatalf("expected 1 warning, got %d: %v", len(warnings), warnings)
-	}
-	if !strings.Contains(warnings[0], "future_tier") {
-		t.Errorf("warning should name unknown plan: %s", warnings[0])
-	}
-	if !strings.Contains(warnings[0], "copilot:") {
-		t.Errorf("warning should use lowercase copilot: prefix: %s", warnings[0])
-	}
-	// Fallback quota = 300; same as Pro, so used_percent should match TestFetch_GoldenFlow_Pro.
-	want := 159.4 / 300 * 100
-	if abs(out.Limits["month"].UsedPercent-want) > 0.01 {
-		t.Errorf("fallback quota wrong: used_percent = %v", out.Limits["month"].UsedPercent)
+	_, _ = c.Fetch(context.Background())
+	if len(warnings) != 0 {
+		t.Errorf("expected zero warnings on unknown plan (fail-closed via error); got: %v", warnings)
 	}
 }
 

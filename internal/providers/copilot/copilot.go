@@ -20,13 +20,12 @@ const (
 	usageEndpointTmpl = "https://api.github.com/users/%s/settings/billing/premium_request/usage?year=%d&month=%d"
 	acceptHeader      = "application/vnd.github+json"
 	timeout           = 10 * time.Second
-	defaultQuota      = 300
 )
 
 // planQuota maps GitHub Copilot plan slugs (from /user.plan.name) to their
 // monthly premium-request quotas. Source:
 // https://docs.github.com/en/copilot/get-started/plans. Unknown slugs
-// fall back to defaultQuota with a warn callback.
+// fail-close — see Fetch for the error path.
 var planQuota = map[string]int{
 	"free":       50,
 	"pro":        300,
@@ -126,11 +125,12 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 		return providers.ProviderOutput{}, errors.New("github /user returned empty login")
 	}
 
-	quota := defaultQuota
-	if q, ok := planQuota[user.Plan.Name]; ok {
-		quota = q
-	} else if c.warn != nil {
-		c.warn(fmt.Sprintf("copilot: unknown plan name %q; falling back to %d/month quota", user.Plan.Name, defaultQuota))
+	quota, ok := planQuota[user.Plan.Name]
+	if !ok {
+		return providers.ProviderOutput{}, fmt.Errorf(
+			"copilot plan %q is not in the known quota table; please file an issue at %s with your plan name (from /user.plan.name)",
+			user.Plan.Name, providers.IssueTrackerURL,
+		)
 	}
 
 	// See claude.go: this `now` and main's checked_at are computed from
