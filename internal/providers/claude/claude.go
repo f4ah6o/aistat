@@ -19,13 +19,14 @@ const (
 	timeout    = 10 * time.Second
 )
 
-// usageWindows is the closed set of API keys we surface. Adding an entry here
+// KnownWindows is the closed set of API keys we surface. Adding an entry here
 // is half of the forward-compat step when Anthropic adds a new public window —
-// the other half is internal/render/text.go's textLabels["claude"]. Any window
-// not listed (seven_day_opus, seven_day_oauth_apps, seven_day_cowork,
-// seven_day_omelette, tangelo, iguana_necktie, omelette_promotional, …) is
-// intentionally filtered out.
-var usageWindows = []string{"five_hour", "seven_day", "seven_day_sonnet"}
+// the other half is internal/render/text.go's textLabels["claude"]; a tripwire
+// test in internal/render catches the dual-table drift. Any window not listed
+// (seven_day_opus, seven_day_oauth_apps, seven_day_cowork, seven_day_omelette,
+// tangelo, iguana_necktie, omelette_promotional, …) is intentionally filtered
+// out.
+var KnownWindows = []string{"five_hour", "seven_day", "seven_day_sonnet"}
 
 type Client struct {
 	doer      *httpx.Doer
@@ -75,7 +76,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	// the provider interface for marginal value.
 	now := time.Now().UTC().Truncate(time.Second)
 	limits := map[string]providers.Limit{}
-	for _, key := range usageWindows {
+	for _, key := range KnownWindows {
 		win := raw[key]
 		if win == nil || win.ResetsAt == nil {
 			continue

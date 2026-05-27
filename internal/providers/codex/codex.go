@@ -24,6 +24,11 @@ const (
 	secondaryWindowSeconds = 604800 // 7 days
 )
 
+// KnownWindows is the set of window keys Codex's Fetch emits. The runtime
+// code in Fetch uses inline string literals (order and conditional inclusion
+// differ); this export documents the contract for the render tripwire test.
+var KnownWindows = []string{"five_hour", "seven_day", "code_review_seven_day"}
+
 type Client struct {
 	doer      *httpx.Doer
 	endpoint  string

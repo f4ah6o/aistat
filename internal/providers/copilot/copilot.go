@@ -22,6 +22,10 @@ const (
 	timeout           = 10 * time.Second
 )
 
+// KnownWindows is the set of window keys Copilot's Fetch emits. Documented
+// here so the render tripwire test can verify dual-table coverage.
+var KnownWindows = []string{"month"}
+
 // planQuota maps GitHub Copilot plan slugs (from /user.plan.name) to their
 // monthly premium-request quotas. Source:
 // https://docs.github.com/en/copilot/get-started/plans. Unknown slugs
@@ -75,6 +79,19 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 }
 
 func (c *Client) ID() string { return "copilot" }
+
+// SetURLsForTest overrides the GitHub API URLs. Intended for tests and forks;
+// not part of the production-use API. Must be called before Fetch.
+func (c *Client) SetURLsForTest(userURL string, usageURL func(login string, year int, month int) string) {
+	c.userURL = userURL
+	c.usageURL = usageURL
+}
+
+// SetReadTokenForTest overrides the credential reader. Tests and forks only;
+// do not call in production code.
+func (c *Client) SetReadTokenForTest(fn func(context.Context) (string, error)) {
+	c.readToken = fn
+}
 
 type userResp struct {
 	Login string `json:"login"`
