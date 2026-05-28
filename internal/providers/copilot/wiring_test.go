@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 // TestWiring_WarnFiresWithCopilotPrefix verifies the provider-side warn

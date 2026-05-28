@@ -6,7 +6,7 @@ import (
 	"flag"
 	"strings"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 func registerFakeMode(fs *flag.FlagSet) func() []providers.Provider {

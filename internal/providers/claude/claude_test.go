@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/cred"
-	"github.com/drogers0/aistat/internal/httpx"
-	"github.com/drogers0/aistat/internal/providers"
-	"github.com/drogers0/aistat/internal/testutil"
+	"github.com/drogers0/aistat/v2/internal/cred"
+	"github.com/drogers0/aistat/v2/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/testutil"
 )
 
 func newTestClient(t *testing.T, body []byte, status int, captureReq *http.Request) *Client {

@@ -12,10 +12,10 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/drogers0/aistat/internal/httpx"
-	"github.com/drogers0/aistat/internal/orchestrate"
-	"github.com/drogers0/aistat/internal/providers"
-	"github.com/drogers0/aistat/internal/render"
+	"github.com/drogers0/aistat/v2/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/orchestrate"
+	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/render"
 )
 
 // version is the goreleaser-injected build tag (via `-ldflags "-X main.version=..."`);

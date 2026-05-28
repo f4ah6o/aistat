@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 func mkLimit(used float64, secs int) providers.Limit {

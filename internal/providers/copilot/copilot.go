@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/drogers0/aistat/internal/cred"
-	"github.com/drogers0/aistat/internal/httpx"
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/cred"
+	"github.com/drogers0/aistat/v2/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 const (

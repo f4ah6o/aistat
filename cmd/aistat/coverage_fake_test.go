@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 // TestFakeProvidersCoversKnownIDs is a tripwire for the fake-build variant.

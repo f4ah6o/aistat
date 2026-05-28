@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 func TestLive_RealAuthAndEndpoint(t *testing.T) {

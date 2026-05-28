@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/cred"
-	"github.com/drogers0/aistat/internal/providers"
-	"github.com/drogers0/aistat/internal/testutil"
+	"github.com/drogers0/aistat/v2/internal/cred"
+	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/testutil"
 )
 
 const testLogin = "testuser" // matches testdata/user.json's "login" field

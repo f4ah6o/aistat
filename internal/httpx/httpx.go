@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 // Doer is a thin wrapper around *http.Client that provides the request/response

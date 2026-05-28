@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 func newDoer(t *testing.T, client *http.Client) *Doer {

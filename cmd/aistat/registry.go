@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/drogers0/aistat/internal/httpx"
-	"github.com/drogers0/aistat/internal/providers"
-	"github.com/drogers0/aistat/internal/providers/claude"
-	"github.com/drogers0/aistat/internal/providers/codex"
-	"github.com/drogers0/aistat/internal/providers/copilot"
+	"github.com/drogers0/aistat/v2/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers/claude"
+	"github.com/drogers0/aistat/v2/internal/providers/codex"
+	"github.com/drogers0/aistat/v2/internal/providers/copilot"
 )
 
 // realProviders constructs the live providers. serialStderr is the

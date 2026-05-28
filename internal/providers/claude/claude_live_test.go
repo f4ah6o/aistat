@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 // TestLive_RealKeychainAndEndpoint hits the user's real macOS Keychain and

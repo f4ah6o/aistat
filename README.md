@@ -27,7 +27,7 @@ Prebuilt binaries are available on the [Releases page](https://github.com/droger
 For Go users, install from source:
 
 ```
-go install github.com/drogers0/aistat/cmd/aistat@latest
+go install github.com/drogers0/aistat/v2/cmd/aistat@latest
 ```
 
 Requires Go 1.22+. Claude, Codex, and Copilot all work on macOS and Linux. The Claude provider reads from the macOS Keychain item populated by `claude /login`, or from `~/.claude/.credentials.json` on Linux. The Claude provider is macOS/Linux-only (it reads platform-specific credential stores); Codex and Copilot work everywhere a Go toolchain runs.

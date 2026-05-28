@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/drogers0/aistat/internal/httpx"
-	"github.com/drogers0/aistat/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
 const retryBackoff = 200 * time.Millisecond

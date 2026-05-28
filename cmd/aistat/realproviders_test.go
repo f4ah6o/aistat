@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/drogers0/aistat/internal/httpx"
+	"github.com/drogers0/aistat/v2/internal/httpx"
 )
 
 func TestWrapWarn_PrefixesLines(t *testing.T) {

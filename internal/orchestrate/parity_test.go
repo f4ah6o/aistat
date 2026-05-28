@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/drogers0/aistat/internal/providers"
-	"github.com/drogers0/aistat/internal/render"
+	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/render"
 )
 
 // TestParity_JSONContract locks the byte-stable JSON shape: every Limit has
