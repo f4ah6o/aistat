@@ -99,26 +99,38 @@ func TestProviderResultOmitempty_AccountsBranch(t *testing.T) {
 	accounts := []AccountResult{{Email: "a@example.com", UUID: "u1", Active: true}}
 	limits := map[string]Limit{"five_hour": {ResetsAt: at}}
 
-	// Accounts set → "limits" key must be absent; the active-row limits live
-	// in accounts[i].limits, so a top-level mirror would duplicate.
+	// Helper: does this provider-level JSON object carry a top-level limits key?
+	hasTopLimits := func(b []byte) bool {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		_, ok := m["limits"]
+		return ok
+	}
+
+	// Accounts set → top-level "limits" key must be absent; the active-row
+	// limits live in accounts[i].limits, so a top-level mirror would duplicate.
 	b, _ := json.Marshal(ProviderResult{Accounts: accounts})
-	if strings.Contains(string(b), `"limits"`) {
+	if hasTopLimits(b) {
 		t.Fatalf("expected no top-level limits key when Accounts set; got %s", b)
 	}
 
 	// Accounts set even with non-nil Limits → still no top-level limits.
 	b, _ = json.Marshal(ProviderResult{Limits: limits, Accounts: accounts})
-	if strings.Contains(string(b), `"limits"`) {
+	if hasTopLimits(b) {
 		t.Fatalf("expected no top-level limits key when Accounts set (even with non-nil Limits); got %s", b)
 	}
-	if !strings.Contains(string(b), `"accounts"`) {
+	var asObj map[string]json.RawMessage
+	_ = json.Unmarshal(b, &asObj)
+	if _, ok := asObj["accounts"]; !ok {
 		t.Fatalf("expected accounts key; got %s", b)
 	}
 
 	// Accounts nil, Limits set → limits present, accounts absent (legacy path
 	// for Codex/Copilot and the Claude no-accounts error case).
 	b, _ = json.Marshal(ProviderResult{Limits: limits})
-	if !strings.Contains(string(b), `"limits"`) {
+	if !hasTopLimits(b) {
 		t.Fatalf("expected limits key on legacy path; got %s", b)
 	}
 	if strings.Contains(string(b), `"accounts"`) {

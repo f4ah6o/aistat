@@ -164,6 +164,8 @@ If GitHub returns a Copilot plan slug `aistat` doesn't recognize, the provider f
 
 For Claude, `accounts` is the **only** view — the per-account row whose `active: true` carries the live account's limits. There is no top-level `limits` mirror; scripts that care about "the active account's headroom" should filter `accounts` for `active: true` and read its `limits`. Codex and Copilot stay single-account: each emits a flat top-level `limits` and no `accounts`.
 
+Each account row always emits a `limits` field — `{five_hour: …, …}` on a successful fetch with recognized windows, `{}` on a successful fetch that returned no recognized windows, and `null` (alongside `error`) when the fetch itself failed. Same convention as Codex/Copilot's top-level `limits`.
+
 `email` is the JSON identifier; UUIDs live in `~/.config/aistat/accounts/claude.json` (Linux) / the macOS keychain index, and surface in `aistat accounts list`'s text output and `aistat switch`'s confirmation line — that's where you read them when you want to use `accounts remove <uuid-prefix>` or `switch --to <uuid-prefix>`.
 
 Every `Limit` has the same four fields: `used_percent`, `remaining_percent`, `resets_at` (ISO 8601, always `+00:00` for UTC, never `Z`), `reset_after_seconds`. The top-level `providers` map is alphabetically sorted.

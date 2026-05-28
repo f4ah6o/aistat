@@ -158,9 +158,13 @@ func TestJSON_ClaudeAccountsOrdering(t *testing.T) {
 	}
 }
 
-func TestJSON_AccountResultErrorOmitsLimits(t *testing.T) {
-	// Per-account error: "limits" key must be absent from that AccountResult,
-	// and also from the provider-level (nil Limits + non-empty Accounts path).
+func TestJSON_AccountResultErrorOnAccountRow(t *testing.T) {
+	// Per-account error: the row carries `"error"` + `"limits": null`. We
+	// deliberately keep `limits` present (not omitempty) so callers can
+	// distinguish `null` (fetch failed) from `{}` (fetched, zero windows
+	// recognized) — same convention as Codex/Copilot top-level Limits.
+	// The provider-level (top-level) limits key is still absent because the
+	// Claude multi-account path doesn't carry a top-level mirror.
 	r := providers.Report{
 		Providers: map[string]providers.ProviderResult{
 			"claude": {Accounts: []providers.AccountResult{
@@ -171,8 +175,8 @@ func TestJSON_AccountResultErrorOmitsLimits(t *testing.T) {
 	var buf bytes.Buffer
 	_ = JSON(&buf, r)
 	s := buf.String()
-	if strings.Contains(s, `"limits"`) {
-		t.Fatalf("error account must not emit limits key: %s", s)
+	if !strings.Contains(s, `"limits": null`) {
+		t.Fatalf("error account should emit limits: null (not omit); got: %s", s)
 	}
 	if !strings.Contains(s, `"error": "usage fetch timed out"`) {
 		t.Fatalf("missing per-account error: %s", s)

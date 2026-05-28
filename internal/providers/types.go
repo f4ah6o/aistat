@@ -106,18 +106,22 @@ func (r Report) MarshalJSON() ([]byte, error) {
 
 // AccountResult is one stored Claude account's contribution to a ProviderResult.
 // Active is intentionally not omitempty — false is meaningful (the account is
-// stored but not currently live). Limits uses omitempty so a per-account fetch
-// error omits the key entirely rather than emitting null. UUID is hidden from
-// JSON (json:"-") because email is the user-facing identifier for scripted
-// consumers; UUIDs surface in `aistat accounts list` text output and in
-// `aistat switch`'s confirmation line, both of which are the discovery
-// surfaces for UUID-prefix matching.
+// stored but not currently live). Limits is intentionally NOT omitempty so a
+// successful fetch with zero recognized windows still serializes as
+// `"limits": {}` rather than vanishing — mirrors the Codex/Copilot top-level
+// contract where `{}` means "asked, got nothing" and `null` means "fetch
+// failed". The per-account fetch sets Limits to a non-nil (possibly empty)
+// map on success and leaves it nil + sets Error on failure. UUID is hidden
+// from JSON (json:"-") because email is the user-facing identifier for
+// scripted consumers; UUIDs surface in `aistat accounts list` text output
+// and in `aistat switch`'s confirmation line, both of which are the
+// discovery surfaces for UUID-prefix matching.
 type AccountResult struct {
 	Email  string           `json:"email"`
 	UUID   string           `json:"-"`
 	Plan   string           `json:"plan"`
 	Active bool             `json:"active"`
-	Limits map[string]Limit `json:"limits,omitempty"`
+	Limits map[string]Limit `json:"limits"`
 	Error  string           `json:"error,omitempty"`
 }
 
