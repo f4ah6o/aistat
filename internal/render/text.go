@@ -18,6 +18,28 @@ var textLabels = map[string][]struct{ Key, Label string }{
 	"copilot": {{"month", "month"}},
 }
 
+// rateLimitTierLabels maps known Claude rate_limit_tier values to friendly
+// display names. Unknown tiers fall through to the raw value (drift-tolerant).
+var rateLimitTierLabels = map[string]string{
+	"default_claude_max_5x":  "Max 5x",
+	"default_claude_max_20x": "Max 20x",
+	"default_claude_pro":     "Pro",
+	"default_claude_free":    "Free",
+}
+
+// formatPlanLabel returns the friendly label for a known tier, the raw value
+// for an unknown tier, or "" when tier is empty (so the fallback row's empty
+// Plan renders without a [Plan] suffix).
+func formatPlanLabel(tier string) string {
+	if tier == "" {
+		return ""
+	}
+	if label, ok := rateLimitTierLabels[tier]; ok {
+		return label
+	}
+	return tier
+}
+
 // Text writes the human-readable rendering of report r for the providers in
 // requested (in the given order).
 func Text(w io.Writer, r providers.Report, requested []string) error {
@@ -28,6 +50,13 @@ func Text(w io.Writer, r providers.Report, requested []string) error {
 			continue
 		}
 		title := providers.Title(id) + " usage"
+
+		if len(result.Accounts) > 0 {
+			sections = append(sections, renderAccountsSection(title, id, result.Accounts))
+			continue
+		}
+
+		// Legacy flat form: Codex/Copilot, or Claude without Accounts populated.
 		if result.Error != "" {
 			sections = append(sections, title+": "+result.Error)
 			continue
@@ -69,6 +98,50 @@ func Text(w io.Writer, r providers.Report, requested []string) error {
 		return err
 	}
 	return nil
+}
+
+// renderAccountsSection builds the nested text section for a provider whose
+// ProviderResult has a non-empty Accounts slice (D4). The renderer trusts the
+// caller's ordering — active-first, email-asc is the orchestrator's job.
+func renderAccountsSection(title, providerID string, accts []providers.AccountResult) string {
+	lines := []string{title}
+	known := textLabels[providerID]
+	for _, ar := range accts {
+		// "- <email>[ (active)][ [Plan]]"
+		header := "- " + ar.Email
+		if ar.Active {
+			header += " (active)"
+		}
+		if label := formatPlanLabel(ar.Plan); label != "" {
+			header += " [" + label + "]"
+		}
+		if ar.Error != "" {
+			lines = append(lines, header+": "+ar.Error)
+			continue
+		}
+		lines = append(lines, header)
+		// Inner limit bullets indented 2 spaces, reusing textLabels ordering.
+		seen := map[string]bool{}
+		for _, kl := range known {
+			limit, ok := ar.Limits[kl.Key]
+			if !ok {
+				continue
+			}
+			seen[kl.Key] = true
+			lines = append(lines, "  "+formatLimitLine(kl.Label, limit))
+		}
+		var unknownKeys []string
+		for k := range ar.Limits {
+			if !seen[k] {
+				unknownKeys = append(unknownKeys, k)
+			}
+		}
+		sort.Strings(unknownKeys)
+		for _, k := range unknownKeys {
+			lines = append(lines, "  "+formatLimitLine(k, ar.Limits[k]))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func formatLimitLine(label string, l providers.Limit) string {

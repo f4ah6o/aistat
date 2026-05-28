@@ -94,6 +94,82 @@ func TestReportMarshalJSON(t *testing.T) {
 	}
 }
 
+func TestProviderResultOmitempty_AccountsBranch(t *testing.T) {
+	at, _ := time.Parse(time.RFC3339, "2026-05-26T20:00:00Z")
+	accounts := []AccountResult{{Email: "a@example.com", UUID: "u1", Active: true}}
+	limits := map[string]Limit{"five_hour": {ResetsAt: at}}
+
+	// Helper: does this provider-level JSON object carry a top-level limits key?
+	hasTopLimits := func(b []byte) bool {
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		_, ok := m["limits"]
+		return ok
+	}
+
+	// Accounts set → top-level "limits" key must be absent; the active-row
+	// limits live in accounts[i].limits, so a top-level mirror would duplicate.
+	b, _ := json.Marshal(ProviderResult{Accounts: accounts})
+	if hasTopLimits(b) {
+		t.Fatalf("expected no top-level limits key when Accounts set; got %s", b)
+	}
+
+	// Accounts set even with non-nil Limits → still no top-level limits.
+	b, _ = json.Marshal(ProviderResult{Limits: limits, Accounts: accounts})
+	if hasTopLimits(b) {
+		t.Fatalf("expected no top-level limits key when Accounts set (even with non-nil Limits); got %s", b)
+	}
+	var asObj map[string]json.RawMessage
+	_ = json.Unmarshal(b, &asObj)
+	if _, ok := asObj["accounts"]; !ok {
+		t.Fatalf("expected accounts key; got %s", b)
+	}
+
+	// Accounts nil, Limits set → limits present, accounts absent (legacy path
+	// for Codex/Copilot and the Claude no-accounts error case).
+	b, _ = json.Marshal(ProviderResult{Limits: limits})
+	if !hasTopLimits(b) {
+		t.Fatalf("expected limits key on legacy path; got %s", b)
+	}
+	if strings.Contains(string(b), `"accounts"`) {
+		t.Fatalf("expected no accounts key on legacy path; got %s", b)
+	}
+}
+
+func TestAccountResult_ActiveFalseSerialized(t *testing.T) {
+	b, _ := json.Marshal(AccountResult{Active: false})
+	if !strings.Contains(string(b), `"active":false`) {
+		t.Fatalf("active:false must serialize (omitempty must NOT be on the bool); got %s", b)
+	}
+}
+
+func TestAccountResult_FieldOrder(t *testing.T) {
+	at, _ := time.Parse(time.RFC3339, "2026-05-26T20:00:00Z")
+	a := AccountResult{
+		Email:  "a@example.com",
+		UUID:   "u1",
+		Plan:   "Max 5x",
+		Active: true,
+		Limits: map[string]Limit{"x": {ResetsAt: at}},
+		Error:  "oops",
+	}
+	b, _ := json.Marshal(a)
+	s := string(b)
+	if strings.Contains(s, `"uuid"`) {
+		t.Fatalf("UUID must not appear in JSON (json:\"-\"); got %s", s)
+	}
+	idxEmail := strings.Index(s, "email")
+	idxPlan := strings.Index(s, "plan")
+	idxActive := strings.Index(s, "active")
+	idxLimits := strings.Index(s, "limits")
+	idxError := strings.Index(s, "error")
+	if !(idxEmail < idxPlan && idxPlan < idxActive && idxActive < idxLimits && idxLimits < idxError) {
+		t.Fatalf("AccountResult field order wrong; got %s", s)
+	}
+}
+
 func TestProviderResult_LimitsAlwaysEmitted(t *testing.T) {
 	// Failure case: nil limits, error populated → "limits":null, error key
 	// present.

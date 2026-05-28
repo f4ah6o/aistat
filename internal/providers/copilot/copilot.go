@@ -120,8 +120,8 @@ type usageResp struct {
 // no JSON body, or with a `message` we don't recognize, falls through to
 // DefaultClassify (surfaces as bare HTTP 404) so we never lie about the
 // cause.
-func classifyCopilot(url string, status int, body []byte) error {
-	if status == 404 {
+func classifyCopilot(url string, resp *http.Response, body []byte) error {
+	if resp.StatusCode == 404 {
 		var env struct {
 			Message string `json:"message"`
 		}
@@ -132,7 +132,7 @@ func classifyCopilot(url string, status int, body []byte) error {
 			}
 		}
 	}
-	return httpx.DefaultClassify(url, status, body)
+	return httpx.DefaultClassify(url, resp, body)
 }
 
 func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {

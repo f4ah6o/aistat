@@ -30,7 +30,7 @@ func TestCLI_FakeJSON_All(t *testing.T) {
 }
 
 func TestCLI_FakeJSON_SingleProvider(t *testing.T) {
-	r := runCLI("claude", "--fake")
+	r := runCLI("usage", "claude", "--fake")
 	if r.code != 0 {
 		t.Fatalf("exit %d, stderr: %s", r.code, r.stderr)
 	}
@@ -66,8 +66,9 @@ func TestCLI_FakeText_DesignSampleShape(t *testing.T) {
 	}
 }
 
-func TestCLI_ProviderFirst(t *testing.T) {
-	r := runCLI("claude", "--fake", "-h")
+func TestCLI_ProviderViaUsageSubcommand(t *testing.T) {
+	// Provider specified under the "usage" subcommand.
+	r := runCLI("usage", "claude", "--fake", "-h")
 	if r.code != 0 {
 		t.Fatalf("exit %d, stderr: %s", r.code, r.stderr)
 	}
@@ -79,13 +80,14 @@ func TestCLI_ProviderFirst(t *testing.T) {
 	}
 }
 
-func TestCLI_ProviderAfterFlagRejected(t *testing.T) {
-	r := runCLI("--fake", "-h", "claude")
+func TestCLI_UnknownSubcmdWithFakeFlag(t *testing.T) {
+	// A bare token that isn't a known subcommand → exit 2 with unknown-subcommand error.
+	r := runCLI("--fake", "-h", "bogussubcmd")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d (stdout %q)", r.code, r.stdout)
 	}
-	if !strings.Contains(r.stderr, "provider must come first") {
-		t.Fatalf("missing provider-must-come-first error: %s", r.stderr)
+	if !strings.Contains(r.stderr, `unknown subcommand "bogussubcmd"`) {
+		t.Fatalf("missing unknown-subcommand error: %s", r.stderr)
 	}
 }
 
@@ -97,12 +99,13 @@ func TestCLI_HumanLongForm(t *testing.T) {
 	}
 }
 
-func TestCLI_TrailingPositionalRejected(t *testing.T) {
-	r := runCLI("--fake", "bogus")
+func TestCLI_TrailingPositionalUnderUsage(t *testing.T) {
+	// Two positionals under "usage" → second is rejected.
+	r := runCLI("usage", "claude", "codex", "--fake")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
-	if !strings.Contains(r.stderr, "unexpected positional argument: bogus") {
+	if !strings.Contains(r.stderr, "unexpected positional argument: codex") {
 		t.Fatalf("missing trailing-positional error: %s", r.stderr)
 	}
 }
@@ -131,15 +134,5 @@ func TestCLI_FakeProviderFailureExits1(t *testing.T) {
 	codex, _ := provs["codex"].(map[string]any)
 	if codex["limits"] == nil {
 		t.Errorf("expected codex.limits to still be present (a failing sibling does not block successes), got %v", codex)
-	}
-}
-
-func TestCLI_TwoPositionalsRejected(t *testing.T) {
-	r := runCLI("claude", "codex")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2 for two providers, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "unexpected positional argument: codex") {
-		t.Fatalf("missing trailing-positional error: %s", r.stderr)
 	}
 }

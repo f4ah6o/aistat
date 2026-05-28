@@ -36,11 +36,33 @@ func (f *fakeProvider) Fetch(ctx context.Context) (providers.ProviderOutput, err
 	}
 	switch f.id {
 	case "claude":
-		return providers.ProviderOutput{Limits: map[string]providers.Limit{
+		activeLimits := map[string]providers.Limit{
 			"five_hour":        mk(2, 4*time.Hour+53*time.Minute),
 			"seven_day":        mk(21, 2*24*time.Hour+5*time.Hour),
 			"seven_day_sonnet": mk(0, 2*24*time.Hour+5*time.Hour),
-		}}, nil
+		}
+		return providers.ProviderOutput{
+			Limits: activeLimits,
+			Accounts: []providers.AccountResult{
+				{
+					Email:  "personal@example.com",
+					UUID:   "aaaaaaaa-1111-2222-3333-444444444444",
+					Plan:   "default_claude_max_5x",
+					Active: true,
+					Limits: activeLimits,
+				},
+				{
+					Email:  "work@example.com",
+					UUID:   "bbbbbbbb-5555-6666-7777-888888888888",
+					Plan:   "default_claude_max_20x",
+					Active: false,
+					Limits: map[string]providers.Limit{
+						"five_hour": mk(71, 5*time.Minute),
+						"seven_day": mk(44, 5*24*time.Hour+9*time.Hour),
+					},
+				},
+			},
+		}, nil
 	case "codex":
 		return providers.ProviderOutput{Limits: map[string]providers.Limit{
 			"five_hour":             mk(0, 3*time.Hour+12*time.Minute),

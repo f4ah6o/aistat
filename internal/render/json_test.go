@@ -10,6 +10,9 @@ import (
 )
 
 func TestJSON_DesignSample(t *testing.T) {
+	// Claude uses the new Accounts shape (active account's limits also
+	// projected to top-level limits per D3). Timestamp format checks are
+	// anchored on the per-account limits entry.
 	checked, _ := time.Parse(time.RFC3339, "2026-05-26T20:00:00Z")
 	mk := func(used float64, secs int) providers.Limit {
 		return providers.Limit{
@@ -22,9 +25,18 @@ func TestJSON_DesignSample(t *testing.T) {
 	r := providers.Report{
 		CheckedAt: checked,
 		Providers: map[string]providers.ProviderResult{
-			"claude": {Limits: map[string]providers.Limit{
-				"five_hour": mk(2, 17625),
-			}},
+			"claude": {
+				Limits: map[string]providers.Limit{"five_hour": mk(2, 17625)},
+				Accounts: []providers.AccountResult{
+					{
+						Email:  "me@example.com",
+						UUID:   "uuid-abc",
+						Plan:   "default_claude_pro",
+						Active: true,
+						Limits: map[string]providers.Limit{"five_hour": mk(2, 17625)},
+					},
+				},
+			},
 		},
 	}
 	var buf bytes.Buffer
@@ -44,6 +56,9 @@ func TestJSON_DesignSample(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Fatalf("expected trailing newline")
+	}
+	if !strings.Contains(got, `"accounts"`) {
+		t.Fatalf("missing accounts key: %s", got)
 	}
 }
 
@@ -119,5 +134,69 @@ func TestJSON_SuccessProviderOmitsErrorKey(t *testing.T) {
 	_ = JSON(&buf, r)
 	if strings.Contains(buf.String(), `"error"`) {
 		t.Fatalf("error key should be omitted on success: %s", buf.String())
+	}
+}
+
+func TestJSON_ClaudeAccountsOrdering(t *testing.T) {
+	// The JSON renderer preserves slice order. Active account must appear
+	// before the inactive one (the orchestrator guarantees active-first).
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"claude": {Accounts: []providers.AccountResult{
+				{Email: "b@example.com", Active: true},
+				{Email: "a@example.com", Active: false},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = JSON(&buf, r)
+	s := buf.String()
+	iB := strings.Index(s, `"b@example.com"`)
+	iA := strings.Index(s, `"a@example.com"`)
+	if iB >= iA {
+		t.Fatalf("active account b should appear before a: %s", s)
+	}
+}
+
+func TestJSON_AccountResultErrorOnAccountRow(t *testing.T) {
+	// Per-account error: the row carries `"error"` + `"limits": null`. We
+	// deliberately keep `limits` present (not omitempty) so callers can
+	// distinguish `null` (fetch failed) from `{}` (fetched, zero windows
+	// recognized) — same convention as Codex/Copilot top-level Limits.
+	// The provider-level (top-level) limits key is still absent because the
+	// Claude multi-account path doesn't carry a top-level mirror.
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"claude": {Accounts: []providers.AccountResult{
+				{Email: "x@example.com", Active: true, Error: "usage fetch timed out"},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = JSON(&buf, r)
+	s := buf.String()
+	if !strings.Contains(s, `"limits": null`) {
+		t.Fatalf("error account should emit limits: null (not omit); got: %s", s)
+	}
+	if !strings.Contains(s, `"error": "usage fetch timed out"`) {
+		t.Fatalf("missing per-account error: %s", s)
+	}
+}
+
+func TestJSON_AccountResultActiveFalse(t *testing.T) {
+	// Active=false must serialize as "active": false — not omitted.
+	// This is load-bearing: callers use the field to distinguish stored-
+	// but-inactive from stored-and-active accounts.
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"claude": {Accounts: []providers.AccountResult{
+				{Email: "x@example.com", Active: false},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = JSON(&buf, r)
+	if !strings.Contains(buf.String(), `"active": false`) {
+		t.Fatalf("Active=false must not be omitted: %s", buf.String())
 	}
 }

@@ -87,33 +87,25 @@ func TestRun_OneFails(t *testing.T) {
 	}
 }
 
-func TestRun_TransientIsRetriedOnce(t *testing.T) {
-	p := &stubProvider{id: "claude", results: []stubResult{
+// TestRun_FetchInvokedOncePerProvider asserts that the orchestrator calls each
+// provider's Fetch exactly once per Run, even when Fetch returns ErrTransient.
+// HTTP-layer retries happen inside httpx.Doer; the orchestrator does not retry.
+func TestRun_FetchInvokedOncePerProvider(t *testing.T) {
+	transient := &stubProvider{id: "claude", results: []stubResult{
 		{err: fmt.Errorf("%w: HTTP 503", providers.ErrTransient)},
-		{out: mkOutput(2)},
 	}}
-	r, status := Run(context.Background(), []string{"claude"}, []providers.Provider{p}, Options{})
-	if status != StatusOK {
-		t.Errorf("status = %d, want OK after retry success", status)
-	}
-	if p.calls.Load() != 2 {
-		t.Errorf("provider should be called twice, got %d", p.calls.Load())
-	}
-	if r.Providers["claude"].Error != "" {
-		t.Errorf("claude should not have error after retry: %s", r.Providers["claude"].Error)
-	}
-}
+	ok := &stubProvider{id: "codex", results: []stubResult{{out: mkOutput(5)}}}
 
-func TestRun_TransientFailsTwice(t *testing.T) {
-	p := &stubProvider{id: "claude", results: []stubResult{
-		{err: fmt.Errorf("%w: HTTP 503", providers.ErrTransient)},
-	}}
-	_, status := Run(context.Background(), []string{"claude"}, []providers.Provider{p}, Options{})
-	if status != StatusAnyFailed {
-		t.Errorf("status = %d, want AnyFailed after two transient failures", status)
+	_, status := Run(context.Background(), []string{"claude", "codex"}, []providers.Provider{transient, ok}, Options{})
+
+	if transient.calls.Load() != 1 {
+		t.Errorf("transient provider: expected 1 call, got %d", transient.calls.Load())
 	}
-	if p.calls.Load() != 2 {
-		t.Errorf("provider should be called twice (initial + retry), got %d", p.calls.Load())
+	if ok.calls.Load() != 1 {
+		t.Errorf("ok provider: expected 1 call, got %d", ok.calls.Load())
+	}
+	if status != StatusAnyFailed {
+		t.Errorf("status = %d, want StatusAnyFailed (transient provider failed)", status)
 	}
 }
 
@@ -126,21 +118,18 @@ func TestRun_AuthErrorIsNotRetried(t *testing.T) {
 		t.Errorf("status = %d, want AnyFailed", status)
 	}
 	if p.calls.Load() != 1 {
-		t.Errorf("auth error should not be retried; calls = %d", p.calls.Load())
+		t.Errorf("auth error should produce exactly one call; calls = %d", p.calls.Load())
 	}
 }
 
-func TestRun_DebugWritesPerAttempt(t *testing.T) {
+func TestRun_DebugWritesLines(t *testing.T) {
 	// Providers run concurrently; wrap the bytes.Buffer so per-provider
 	// debug lines don't interleave mid-write. (Real CLI does the same via
 	// realProviders wiring.)
 	var buf bytes.Buffer
 	safe := httpx.NewConcurrencySafeWriter(&buf)
 	p1 := &stubProvider{id: "claude", results: []stubResult{{out: mkOutput(2)}}}
-	p2 := &stubProvider{id: "codex", results: []stubResult{
-		{err: fmt.Errorf("%w: HTTP 503", providers.ErrTransient)},
-		{out: mkOutput(5)},
-	}}
+	p2 := &stubProvider{id: "codex", results: []stubResult{{out: mkOutput(5)}}}
 	Run(context.Background(), []string{"claude", "codex"}, []providers.Provider{p1, p2}, Options{Debug: safe})
 	out := buf.String()
 	if !strings.Contains(out, "[debug] claude:") {
@@ -148,9 +137,6 @@ func TestRun_DebugWritesPerAttempt(t *testing.T) {
 	}
 	if !strings.Contains(out, "[debug] codex:") {
 		t.Errorf("debug missing codex line: %s", out)
-	}
-	if !strings.Contains(out, "[retry]") {
-		t.Errorf("retry line should be marked: %s", out)
 	}
 }
 
@@ -173,42 +159,6 @@ func TestFetchOnce_DebugLineSingleLineOnMultilineError(t *testing.T) {
 	}
 	if !strings.HasPrefix(out, "[debug] claude:") {
 		t.Errorf("expected line to start with [debug] claude:, got:\n%s", out)
-	}
-}
-
-func TestRun_ContextCancellationDuringBackoff(t *testing.T) {
-	// Deterministic: stub signals on a channel as soon as the first call begins;
-	// the test reads the signal, cancels the parent ctx, then a 1s backoff makes
-	// the orchestrator's <-time.After(backoff) lose to <-ctx.Done() with no race.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	firstCallDone := make(chan struct{})
-	p := &stubProvider{id: "claude", fetch: func(_ context.Context) (providers.ProviderOutput, error) {
-		close(firstCallDone)
-		return providers.ProviderOutput{}, fmt.Errorf("%w: HTTP 503", providers.ErrTransient)
-	}}
-
-	runDone := make(chan struct{})
-	var report providers.Report
-	var status ExitStatus
-	go func() {
-		defer close(runDone)
-		report, status = Run(ctx, []string{"claude"}, []providers.Provider{p}, Options{RetryBackoff: 1 * time.Second})
-	}()
-
-	<-firstCallDone
-	cancel()
-	<-runDone
-
-	if status != StatusAnyFailed {
-		t.Errorf("status should be AnyFailed on cancellation, got %d", status)
-	}
-	if errMsg := report.Providers["claude"].Error; !strings.Contains(errMsg, "context canceled") {
-		t.Errorf("expected context canceled error, got %q", errMsg)
-	}
-	if p.calls.Load() != 1 {
-		t.Errorf("provider should be called once (cancel during backoff prevents retry); got %d", p.calls.Load())
 	}
 }
 
@@ -293,6 +243,90 @@ func TestRun_LimitsJSONShape_SuccessEmptyVsFailure(t *testing.T) {
 	}
 	if !strings.Contains(got, `"error":`) {
 		t.Errorf("failure should include error key, got %s", got)
+	}
+}
+
+// TestRun_AccountMixedResult_ExitZero: one ok account + one error account with
+// nil Fetch error → StatusOK. Per-account errors don't flip the exit code.
+func TestRun_AccountMixedResult_ExitZero(t *testing.T) {
+	okAcc := providers.AccountResult{
+		Email: "a@example.com", UUID: "uuid-a", Active: true,
+		Limits: map[string]providers.Limit{"five_hour": {UsedPercent: 10, RemainingPercent: 90}},
+	}
+	errAcc := providers.AccountResult{Email: "b@example.com", UUID: "uuid-b", Error: "HTTP 503"}
+	p := &stubProvider{id: "claude", results: []stubResult{{
+		out: providers.ProviderOutput{Accounts: []providers.AccountResult{okAcc, errAcc}},
+	}}}
+	r, status := Run(context.Background(), []string{"claude"}, []providers.Provider{p}, Options{})
+	if status != StatusOK {
+		t.Errorf("status = %d, want OK (per-account errors do not flip exit code)", status)
+	}
+	result := r.Providers["claude"]
+	if len(result.Accounts) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(result.Accounts))
+	}
+	if result.Accounts[0].Error != "" {
+		t.Errorf("accounts[0] (ok) should have no error, got %q", result.Accounts[0].Error)
+	}
+	if result.Accounts[1].Error == "" {
+		t.Errorf("accounts[1] should carry per-account error string")
+	}
+	if result.Error != "" {
+		t.Errorf("provider-level Error should be empty, got %q", result.Error)
+	}
+}
+
+// TestRun_AccountAllError_NonTransient_PreservesAccounts: all-error accounts +
+// non-transient provider error → StatusAnyFailed (no retry); account rows preserved.
+func TestRun_AccountAllError_NonTransient_PreservesAccounts(t *testing.T) {
+	errAccounts := []providers.AccountResult{
+		{Email: "a@example.com", UUID: "uuid-a", Error: "auth denied"},
+		{Email: "b@example.com", UUID: "uuid-b", Error: "auth denied"},
+	}
+	p := &stubProvider{id: "claude", results: []stubResult{{
+		out: providers.ProviderOutput{Accounts: errAccounts},
+		err: fmt.Errorf("%w: all accounts rejected", providers.ErrAuthDenied),
+	}}}
+	r, status := Run(context.Background(), []string{"claude"}, []providers.Provider{p}, Options{})
+	if status != StatusAnyFailed {
+		t.Errorf("status = %d, want AnyFailed", status)
+	}
+	if p.calls.Load() != 1 {
+		t.Errorf("non-transient error must not trigger retry, calls = %d", p.calls.Load())
+	}
+	result := r.Providers["claude"]
+	if len(result.Accounts) != 2 {
+		t.Fatalf("expected 2 preserved account rows, got %d", len(result.Accounts))
+	}
+	if result.Error == "" {
+		t.Errorf("provider-level Error should be set")
+	}
+}
+
+// TestRun_AccountAllError_BareError_PreservesAccounts: all-error accounts + bare
+// (non-classified) Fetch error → StatusAnyFailed (no retry); account rows preserved.
+func TestRun_AccountAllError_BareError_PreservesAccounts(t *testing.T) {
+	errAccounts := []providers.AccountResult{
+		{Email: "a@example.com", UUID: "uuid-a", Error: "timeout"},
+		{Email: "b@example.com", UUID: "uuid-b", Error: "timeout"},
+	}
+	p := &stubProvider{id: "claude", results: []stubResult{{
+		out: providers.ProviderOutput{Accounts: errAccounts},
+		err: fmt.Errorf("network timeout"),
+	}}}
+	r, status := Run(context.Background(), []string{"claude"}, []providers.Provider{p}, Options{})
+	if status != StatusAnyFailed {
+		t.Errorf("status = %d, want AnyFailed", status)
+	}
+	if p.calls.Load() != 1 {
+		t.Errorf("bare error must not trigger retry, calls = %d", p.calls.Load())
+	}
+	result := r.Providers["claude"]
+	if len(result.Accounts) != 2 {
+		t.Fatalf("expected 2 preserved account rows, got %d", len(result.Accounts))
+	}
+	if result.Error == "" {
+		t.Errorf("provider-level Error should be set")
 	}
 }
 

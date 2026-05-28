@@ -1,13 +1,17 @@
 # aistat
 
-A single static **Go binary** that reports your Claude, Codex, and Copilot usage from the terminal.
+A single static **Go binary** that reports your Claude, Codex, and Copilot usage from the terminal — and (Claude only) switches between multiple stored Claude accounts without a browser round-trip.
 
 ```
 $ aistat -h
 Claude usage
-- 5-hour: 6.0% (resets in 4h 48m)
-- 7-day: 42.0% (resets in 48m)
-- 7-day sonnet: 10.0% (resets in 48m)
+- personal@example.com (active) [Max 5x]
+  - 5-hour: 2.0% (resets in 4h 53m)
+  - 7-day: 21.0% (resets in 2d 5h)
+  - 7-day sonnet: 0.0% (resets in 2d 5h)
+- work@example.com [Max 20x]
+  - 5-hour: 71.0% (resets in 5m)
+  - 7-day: 44.0% (resets in 5d 9h)
 
 Codex usage
 - 5-hour: 2.0% (resets in 2h 26m)
@@ -34,50 +38,114 @@ Requires Go 1.22+. Claude, Codex, and Copilot all work on macOS and Linux. The C
 
 ## Usage
 
+`aistat` uses a subcommand surface as of v2.1.0:
+
 ```
-aistat                # all services, JSON
-aistat claude         # claude only, JSON
-aistat codex          # codex only, JSON
-aistat copilot        # copilot only, JSON
-aistat -h             # all services, human-readable text
-aistat claude -h      # claude only, human-readable
-aistat --debug        # one line per HTTP request + per-provider summary, to stderr
-aistat --version      # print version and exit
-aistat --help         # print help
+aistat                            # default: same as `aistat usage`
+aistat usage                      # report usage across all providers/accounts
+aistat usage <provider>           # report a single provider (claude | codex | copilot)
+aistat switch                     # auto-switch claude to the account with the most headroom
+aistat switch --to <email|uuid>   # switch to a specific stored claude account
+aistat accounts list              # list stored claude accounts
+aistat accounts remove <id>       # remove a stored claude account (by email substring or uuid prefix)
+
+aistat usage --refresh            # bypass the 30s per-account cache; force a fresh read
+aistat -h, --human                # render human-readable text (affects `usage` only)
+aistat --debug                    # per-request + per-provider lines on stderr
+aistat --version                  # print version and exit
+aistat --help                     # print help and exit
 ```
 
-`-h` is the short form of `--human` (the text renderer). Help is `--help` only.
+The pre-v2.1.0 positional-provider form (`aistat claude`) is gone — use `aistat usage claude`.
+
+## Multiple Claude accounts
+
+`aistat` quietly captures every Claude account you sign into. The first time you run `aistat usage` after a `claude /login`, `aistat` reads the live keychain credential, looks the account up via Anthropic's `/api/oauth/profile` endpoint, and stores the credential blob keyed by `account.uuid`. On subsequent runs the access token is byte-matched to the stored slot, so there's no extra profile call in steady state.
+
+Stored accounts are kept:
+
+- **macOS:** one keychain item per account at service `aistat:accounts:claude:<uuid>`, plus a small index item. A darwin-only `flock` on `$HOME/Library/Caches/aistat/store.lock` serializes concurrent `aistat` invocations.
+- **Linux:** one JSON file at `~/.config/aistat/accounts/claude.json` (mode `0600`), with `flock` across read/mutate/rename.
+
+`aistat accounts list` shows every stored account with a `(stale)` suffix if its `last_seen_at` is more than 30 days old. `aistat accounts remove <id>` deletes one. The currently-active account is protected — switch to a different account via `aistat switch --to <email>` or run `claude /logout` first.
+
+### `aistat switch`
+
+`aistat switch` rewrites the live `Claude Code-credentials` keychain item to a different stored account, with no browser round-trip:
+
+- **Auto-pick** (`aistat switch` with no arg): picks the stored account with the most `five_hour` headroom. Accounts whose stored access token has expired are excluded with a `(stored credential rejected; run \`aistat usage\` to refresh)` warn on stderr — `aistat usage` will refresh+re-store, and a subsequent `aistat switch` will pick it up.
+- **Explicit** (`aistat switch --to <email|uuid>`): switches to a specific stored account. Argument matching: 8+ hex/dash characters is a UUID prefix; anything else is an email substring (case-insensitive).
+
+The auto-pick comparator buckets candidates by `floor(remaining_percent / 5)` (so 87% and 89% live in the same bucket, 83% lives in a lower one), then breaks ties by most-recent `last_seen_at`. This means a freshly-reset account (100% remaining) outranks a 95%-remaining one even if you were about to hammer the fresh account — auto-pick optimizes *relative headroom*, not "has enough quota for the workload you're about to start." For nuanced cases use `--to` explicitly.
+
+After the switch, `aistat` reconciles the multi-account store so the now-active slot's `last_seen_at` is current. If the keychain write fails, the multi-account store is untouched and `aistat` exits 2 with the failure reason.
+
+### Security note
+
+`aistat switch` writes to the Claude CLI's own keychain item only under an explicit user action; the regular `aistat usage` path is observation-only and never mutates the live keychain.
+
+On macOS, `aistat switch` updates the live keychain item via a single `security add-generic-password -U` call. The `-U` flag updates the value in place; the per-binary access-control list that `claude /login` originally placed on the item — which grants the Claude CLI silent-read access — survives the update, so subsequent Claude CLI reads do not prompt. We do not also call `security set-generic-password-partition-list`: that call would interrupt every switch with a keychain-password prompt as a macOS security requirement, while making no observable difference to the Claude CLI's access. If you ever do observe a system prompt from the Claude CLI itself reading the credential after `aistat switch`, please file an issue.
+
+Multi-account storage aggregates several Claude credentials in one place. `aistat accounts list` flags any account with `last_seen_at > 30 days` as `(stale)` so you can prune it with `aistat accounts remove`.
 
 ## How it works
 
-Each provider has one credential source and one HTTPS endpoint:
+Each provider has one credential source and a small set of HTTPS endpoints:
 
-| Provider | Credential | Endpoint |
-|----------|------------|----------|
-| Claude   | macOS Keychain item `Claude Code-credentials` (populated by `claude /login`) | `api.anthropic.com/api/oauth/usage` |
+| Provider | Credential | Endpoints |
+|----------|------------|-----------|
+| Claude   | macOS Keychain item `Claude Code-credentials` (populated by `claude /login`), or `~/.claude/.credentials.json` on Linux | `api.anthropic.com/api/oauth/usage` (usage), `api.anthropic.com/api/oauth/profile` (account identity for multi-account capture), `platform.claude.com/v1/oauth/token` (refresh for stored accounts) |
 | Codex    | `~/.codex/auth.json` (populated by `codex login`) | `chatgpt.com/backend-api/wham/usage` |
 | Copilot  | `gh auth token` (populated by `gh auth login`; needs the `user` scope) | `api.github.com/users/{login}/settings/billing/premium_request/usage` |
 
 Providers are fetched in parallel. A failing provider does not block the others; each failed provider's error message is surfaced in the JSON (`providers.<id>.error`) and as `<Cap> usage: <error>` in text mode. See [Exit codes](#exit-codes) below.
+
+For multi-account Claude, the per-account fetches run sequentially within the Claude provider with a dynamic timeout budget of `10s + 15s × N` where N is the number of stored accounts. A single transient failure on one of several accounts does not flip the overall exit code — it's surfaced as a per-account error in the JSON and the next run resolves it.
+
+### Caching
+
+`aistat usage` caches each Claude account's usage response for 30 seconds, keyed by `account.uuid`, at `$CACHE/aistat/usage/claude-v1.json` (macOS: `~/Library/Caches/aistat/usage/claude-v1.json`). This absorbs back-to-back invocations from scripts and interactive testing without adding load to Anthropic's per-token rate limit. Future format changes land under a new filename (e.g. `claude-v2.json`); older binaries keep using their own `-v1.json` with no interference.
+
+To skip the cache and force a fresh read: `aistat usage --refresh`. The cache is rewritten with the fresh result either way, so the next invocation without the flag still benefits.
+
+`aistat switch` reads through the same cache. To force fresh data for the switch decision, run `aistat usage --refresh` first.
+
+Override the TTL with the `AISTAT_USAGE_CACHE_TTL` env var (e.g. `AISTAT_USAGE_CACHE_TTL=10s`). The default is intentionally conservative. If the cache can't be set up (read-only home, permission denied), it emits a one-time warn on stderr and stays disabled for the rest of the process; `aistat usage` proceeds without caching. A corrupt or truncated file recovers on the next successful fetch — the `Put` overwrites it via atomic rename.
+
+### Reliability
+
+Transient HTTP failures (HTTP 408, 429, 5xx, network errors) are retried up to 3 times per request inside `httpx.Doer`, honoring `Retry-After` (capped at 10s) when present and falling back to exponential backoff with ±20% jitter otherwise. The orchestrator does not add an additional outer retry; the HTTP layer's bounded inner retries are the only retry path. Sleeps that would exceed the per-account budget are skipped (returning the last error early) so the CLI doesn't block longer than the 15s per-account ceiling.
 
 ### Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | All requested providers succeeded. |
-| 1 | One or more requested providers failed at runtime (transient HTTP, missing credentials). |
-| 2 | Usage / contract error: unknown provider name, malformed flags, trailing positional argument, or a requested provider is not built into this binary. |
+| 1 | One or more requested providers failed at runtime (provider as a whole produced no account rows AND `Fetch` returned an error). |
+| 2 | Usage / contract error: unknown subcommand, unknown provider, malformed flags, store-open failure on a write-bound subcommand. |
 | 3 | Stdout write error (broken pipe, disk full). |
 
 ## Diagnostics on stderr
 
-Even without `--debug`, the Copilot provider may emit one diagnostic line to stderr when it detects an API drift signal:
+Even without `--debug`, providers may emit diagnostic lines to stderr. All start with `aistat:`.
 
-    aistat: copilot: Copilot-product usageItems present but none matched
-    sku="Copilot Premium Request" — GitHub may have renamed the SKU; please
-    file an issue at https://github.com/drogers0/aistat/issues
+```
+aistat: copilot: Copilot-product usageItems present but none matched
+  sku="Copilot Premium Request" — GitHub may have renamed the SKU; please
+  file an issue at https://github.com/drogers0/aistat/issues
 
-The exit code and stdout payload are unaffected — this is a heads-up that the underlying number may be stale. With `--debug`, additional per-request and per-provider lines are also written to stderr.
+aistat: claude: could not capture live account profile (<reason>); rendering live row
+  without storing — run `claude /login` if this persists across runs
+
+aistat: claude: <email>: stored credential rejected (run `aistat usage` to refresh);
+  excluded from auto-pick
+
+aistat: claude: refresh endpoint rejected request (<status>: <body-snip>); this is
+  likely an aistat refresh implementation issue, not your account. Run `claude /login`
+  to work around it for this account and file an issue at https://github.com/drogers0/aistat/issues
+```
+
+The exit code and stdout payload are unaffected — these are heads-ups that the underlying number may be stale or that one account is excluded from auto-pick. With `--debug`, additional per-request and per-provider lines are also written to stderr.
 
 ## Authentication
 
@@ -87,22 +155,37 @@ If a provider's credential is missing, the error message names the exact command
 gh auth refresh -h github.com -s user
 ```
 
+For Claude, `claude /login`. For Codex, `codex login`.
+
 If GitHub returns a Copilot plan slug `aistat` doesn't recognize, the provider fails closed with a message naming the slug and a link to file an issue.
 
 ## Output contract
 
 ```json
 {
-  "checked_at": "2026-05-26T22:00:00+00:00",
+  "checked_at": "2026-05-28T01:00:00+00:00",
   "providers": {
-    "claude":  { "limits": { "five_hour": {"used_percent": 6, "remaining_percent": 94, "resets_at": "2026-05-27T03:00:00+00:00", "reset_after_seconds": 17280}, ... } },
+    "claude": {
+      "accounts": [
+        { "email": "personal@example.com", "plan": "default_claude_max_5x",  "active": true,  "limits": {...} },
+        { "email": "work@example.com",     "plan": "default_claude_max_20x", "active": false, "limits": {...} }
+      ]
+    },
     "codex":   { "limits": { ... } },
     "copilot": { "limits": { "month": { ... } } }
   }
 }
 ```
 
+For Claude, `accounts` is the **only** view — the per-account row whose `active: true` carries the live account's limits. There is no top-level `limits` mirror; scripts that care about "the active account's headroom" should filter `accounts` for `active: true` and read its `limits`. Codex and Copilot stay single-account: each emits a flat top-level `limits` and no `accounts`.
+
+Each account row always emits a `limits` field — `{five_hour: …, …}` on a successful fetch with recognized windows, `{}` on a successful fetch that returned no recognized windows, and `null` (alongside `error`) when the fetch itself failed. Same convention as Codex/Copilot's top-level `limits`.
+
+`email` is the JSON identifier; UUIDs live in `~/.config/aistat/accounts/claude.json` (Linux) / the macOS keychain index, and surface in `aistat accounts list`'s text output and `aistat switch`'s confirmation line — that's where you read them when you want to use `accounts remove <uuid-prefix>` or `switch --to <uuid-prefix>`.
+
 Every `Limit` has the same four fields: `used_percent`, `remaining_percent`, `resets_at` (ISO 8601, always `+00:00` for UTC, never `Z`), `reset_after_seconds`. The top-level `providers` map is alphabetically sorted.
+
+`AccountResult.active` is intentionally not `omitempty` — `"active": false` is meaningful and must serialize.
 
 ## License
 
