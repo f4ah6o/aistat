@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,7 +14,8 @@ import (
 )
 
 type linuxStore struct {
-	path string
+	path     string
+	lockPath string
 }
 
 // OpenStore returns the Linux file-backed account store at
@@ -31,36 +31,42 @@ func OpenStore(opts ...Option) (Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("accounts: cannot create accounts dir %s: %w", dir, err)
 	}
-	return &linuxStore{path: filepath.Join(dir, "claude.json")}, nil
+	return &linuxStore{
+		path:     filepath.Join(dir, "claude.json"),
+		lockPath: filepath.Join(dir, ".claude.lock"),
+	}, nil
 }
 
-// withWriteLock opens the store file (creating it mode 0600 if absent),
-// acquires LOCK_EX, calls fn with the open file, then releases the lock.
-// Each call opens the file independently (new open file description), so
-// concurrent goroutines also serialize correctly — flock on Linux is per OFD.
-func (s *linuxStore) withWriteLock(fn func(f *os.File) error) error {
-	f, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0600)
+// withLock opens the sentinel lock file (creating it mode 0600 if absent),
+// acquires the requested flock mode, calls fn, then releases the lock. The
+// lock sits on a separate sentinel file rather than the data file because
+// atomicWrite replaces the data file via rename — a flock on the data file's
+// open fd would travel with the orphaned inode after rename, letting a second
+// writer race ahead with stale state. The sentinel never gets renamed so the
+// lock anchors a stable serialization point.
+func (s *linuxStore) withLock(mode int, fn func() error) error {
+	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return fmt.Errorf("accounts: open store file: %w", err)
+		return fmt.Errorf("accounts: open lock file: %w", err)
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := syscall.Flock(int(f.Fd()), mode); err != nil {
 		return fmt.Errorf("accounts: acquire store lock: %w", err)
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
-	return fn(f)
+	return fn()
 }
 
-// readAccountMap reads the current account map from f (must be at position 0).
-// Returns an empty map (not an error) for an empty file.
-// Returns an error for corrupt JSON so the caller can surface it rather than
-// silently discarding stored accounts.
-func readAccountMap(f *os.File) (map[string]Account, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("accounts: seek store file: %w", err)
-	}
-	data, err := io.ReadAll(f)
+// readAccountMap reads the current account map from the data file. Returns an
+// empty map (not an error) for a missing or empty file; returns an error for
+// corrupt JSON so the caller can surface it rather than silently discarding
+// stored accounts. Caller must hold the store lock.
+func (s *linuxStore) readAccountMap() (map[string]Account, error) {
+	data, err := os.ReadFile(s.path)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return make(map[string]Account), nil
+		}
 		return nil, fmt.Errorf("accounts: read store file: %w", err)
 	}
 	if len(data) == 0 {
@@ -104,33 +110,27 @@ func (s *linuxStore) atomicWrite(m map[string]Account) error {
 }
 
 func (s *linuxStore) List(ctx context.Context) ([]Account, error) {
-	f, err := os.OpenFile(s.path, os.O_RDONLY, 0)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, nil
+	var list []Account
+	err := s.withLock(syscall.LOCK_SH, func() error {
+		m, err := s.readAccountMap()
+		if err != nil {
+			return err
 		}
-		return nil, fmt.Errorf("accounts: open store: %w", err)
-	}
-	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
-		return nil, fmt.Errorf("accounts: acquire store lock: %w", err)
-	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
-
-	m, err := readAccountMap(f)
+		list = make([]Account, 0, len(m))
+		for _, a := range m {
+			list = append(list, a)
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	list := make([]Account, 0, len(m))
-	for _, a := range m {
-		list = append(list, a)
 	}
 	return list, nil
 }
 
 func (s *linuxStore) Upsert(ctx context.Context, a Account) error {
-	return s.withWriteLock(func(f *os.File) error {
-		m, err := readAccountMap(f)
+	return s.withLock(syscall.LOCK_EX, func() error {
+		m, err := s.readAccountMap()
 		if err != nil {
 			return err
 		}
@@ -140,15 +140,20 @@ func (s *linuxStore) Upsert(ctx context.Context, a Account) error {
 }
 
 func (s *linuxStore) Delete(ctx context.Context, uuid string) error {
-	return s.withWriteLock(func(f *os.File) error {
-		m, err := readAccountMap(f)
+	return s.withLock(syscall.LOCK_EX, func() error {
+		m, err := s.readAccountMap()
 		if err != nil {
 			return err
 		}
 		delete(m, uuid)
 		if len(m) == 0 {
-			// Remove the file entirely when the last account is deleted.
-			return os.Remove(s.path)
+			// Remove the data file when the last account is deleted. Leave
+			// the lock sentinel in place so subsequent writers serialize
+			// against the same anchor.
+			if err := os.Remove(s.path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("accounts: remove empty store file: %w", err)
+			}
+			return nil
 		}
 		return s.atomicWrite(m)
 	})
