@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2-rewrite]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "2025.1.1"
+      - name: staticcheck (fake build)
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "2025.1.1"
+          build-tags: "fake"
+      - name: go test
+        run: |
+          go test -race ./...
+          go test -race -tags=fake ./...

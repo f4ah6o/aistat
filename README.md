@@ -1,108 +1,109 @@
-# LLM Usage Check
+# aistat
 
-Check your Claude, Codex, and Copilot usage limits from the terminal.
+A single static **Go binary** that reports your Claude, Codex, and Copilot usage from the terminal.
 
 ```
-$ usage-check
+$ aistat -h
 Claude usage
-- 5-hour: 2.0%
-- 7-day: 21.0%
-- 7-day sonnet: 0.0%
+- 5-hour: 6.0% (resets in 4h 48m)
+- 7-day: 42.0% (resets in 48m)
+- 7-day sonnet: 10.0% (resets in 48m)
 
 Codex usage
-- 5-hour: 0.0%
-- 7-day: 11.0%
-- Code review 7-day: 0.0%
+- 5-hour: 2.0% (resets in 2h 26m)
+- 7-day: 0.0% (resets in 6d 21h)
+- Code review 7-day: 0.0% (resets in 6d 21h)  # appears only with recent code-review activity
 
 Copilot usage
-- month: 4.0%
+- month: 67.3% (resets in 5d 1h)
 ```
 
-## Requirements
+JSON is the default; `-h`/`--human` opts into the text rendering above.
 
-- macOS (uses AppleScript to trigger Chrome)
-- Google Chrome with an active login to `claude.ai`, `chatgpt.com`, and `github.com`
-- Node.js 20+
+## Install
 
-## Setup
+Prebuilt binaries are available on the [Releases page](https://github.com/drogers0/aistat/releases).
 
-```bash
-npm install -g https://github.com/drogers0/llm-usage/releases/download/v0.0.3/llm-usage-0.0.3.tgz
-usage-check-setup
+For Go users, install from source:
+
+```
+go install github.com/drogers0/aistat/cmd/aistat@latest
 ```
 
-The setup command walks you through loading the Chrome extension and registering the native messaging host.
+Requires Go 1.22+. Claude, Codex, and Copilot all work on macOS and Linux. The Claude provider reads from the macOS Keychain item populated by `claude /login`, or from `~/.claude/.credentials.json` on Linux. The Claude provider is macOS/Linux-only (it reads platform-specific credential stores); Codex and Copilot work everywhere a Go toolchain runs.
 
 ## Usage
 
-```bash
-usage-check                # all services, human-readable
-usage-check claude         # claude only
-usage-check codex          # codex only
-usage-check copilot        # copilot only
-usage-check --json         # all services, JSON
-usage-check claude --json  # claude only, JSON
-usage-check --debug        # diagnostics on stderr
+```
+aistat                # all services, JSON
+aistat claude         # claude only, JSON
+aistat codex          # codex only, JSON
+aistat copilot        # copilot only, JSON
+aistat -h             # all services, human-readable text
+aistat claude -h      # claude only, human-readable
+aistat --debug        # one line per HTTP request + per-provider summary, to stderr
+aistat --version      # print version and exit
+aistat --help         # print help
 ```
 
-## JSON Output
+`-h` is the short form of `--human` (the text renderer). Help is `--help` only.
+
+## How it works
+
+Each provider has one credential source and one HTTPS endpoint:
+
+| Provider | Credential | Endpoint |
+|----------|------------|----------|
+| Claude   | macOS Keychain item `Claude Code-credentials` (populated by `claude /login`) | `api.anthropic.com/api/oauth/usage` |
+| Codex    | `~/.codex/auth.json` (populated by `codex login`) | `chatgpt.com/backend-api/wham/usage` |
+| Copilot  | `gh auth token` (populated by `gh auth login`; needs the `user` scope) | `api.github.com/users/{login}/settings/billing/premium_request/usage` |
+
+Providers are fetched in parallel. A failing provider does not block the others; each failed provider's error message is surfaced in the JSON (`providers.<id>.error`) and as `<Cap> usage: <error>` in text mode. See [Exit codes](#exit-codes) below.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | All requested providers succeeded. |
+| 1 | One or more requested providers failed at runtime (transient HTTP, missing credentials). |
+| 2 | Usage / contract error: unknown provider name, malformed flags, trailing positional argument, or a requested provider is not built into this binary. |
+| 3 | Stdout write error (broken pipe, disk full). |
+
+## Diagnostics on stderr
+
+Even without `--debug`, the Copilot provider may emit one diagnostic line to stderr when it detects an API drift signal:
+
+    aistat: copilot: Copilot-product usageItems present but none matched
+    sku="Copilot Premium Request" — GitHub may have renamed the SKU; please
+    file an issue at https://github.com/drogers0/aistat/issues
+
+The exit code and stdout payload are unaffected — this is a heads-up that the underlying number may be stale. With `--debug`, additional per-request and per-provider lines are also written to stderr.
+
+## Authentication
+
+If a provider's credential is missing, the error message names the exact command to fix it. For Copilot, the `user` scope is required:
+
+```
+gh auth refresh -h github.com -s user
+```
+
+If GitHub returns a Copilot plan slug `aistat` doesn't recognize, the provider fails closed with a message naming the slug and a link to file an issue.
+
+## Output contract
 
 ```json
 {
-  "checked_at": "2026-03-18T01:06:14+00:00",
+  "checked_at": "2026-05-26T22:00:00+00:00",
   "providers": {
-    "claude": {
-      "limits": {
-        "five_hour": {
-          "used_percent": 2,
-          "remaining_percent": 98,
-          "resets_at": "2026-03-18T05:59:59+00:00",
-          "reset_after_seconds": 17625
-        },
-        "seven_day": { "..." },
-        "seven_day_sonnet": { "..." }
-      }
-    },
-    "codex": {
-      "limits": {
-        "five_hour": { "..." },
-        "seven_day": { "..." },
-        "code_review_seven_day": { "..." }
-      }
-    },
-    "copilot": {
-      "limits": {
-        "month": {
-          "used_percent": 4,
-          "remaining_percent": 96,
-          "resets_at": "2026-04-01T00:00:00+00:00",
-          "reset_after_seconds": 1065600
-        }
-      }
-    }
+    "claude":  { "limits": { "five_hour": {"used_percent": 6, "remaining_percent": 94, "resets_at": "2026-05-27T03:00:00+00:00", "reset_after_seconds": 17280}, ... } },
+    "codex":   { "limits": { ... } },
+    "copilot": { "limits": { "month": { ... } } }
   }
 }
 ```
 
-Each limit window contains `used_percent`, `remaining_percent`, `resets_at` (ISO 8601), and `reset_after_seconds`.
+Every `Limit` has the same four fields: `used_percent`, `remaining_percent`, `resets_at` (ISO 8601, always `+00:00` for UTC, never `Z`), `reset_after_seconds`. The top-level `providers` map is alphabetically sorted.
 
-## How It Works
+## License
 
-1. `usage-check` triggers the Chrome extension via AppleScript (opens a 1×1 pixel window — Chrome stays in the background).
-2. The extension opens tabs to `claude.ai`, `chatgpt.com`, and `github.com` inside that hidden window.
-3. It runs `fetch()` inside the page context using your existing browser sessions.
-4. Results are sent to a native messaging host which writes them to `.cache/`.
-5. The CLI reads the cached JSON and renders it.
-
-## Troubleshooting
-
-- **`Missing EXTENSION_ID in .env`** — Run `usage-check-setup <extension-id>`.
-- **`Timed out waiting for extension fetch`** — Make sure Chrome is running and you're logged in to the services.
-- **Extension not working after Chrome update** — Reload at `chrome://extensions` and re-run `usage-check-setup`.
-- **`Missing renderer: dist/cli/render.js`** — Run `npm run build`.
-
-## Security
-
-- `.env` and `.cache/` are gitignored.
-- Cached responses contain only usage percentages, not credentials.
-- The native messaging host only writes to files inside this project directory.
+MIT — see [LICENSE](LICENSE).

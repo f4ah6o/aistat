@@ -1,0 +1,42 @@
+version: 2
+project_name: aistat
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: aistat
+    main: ./cmd/aistat
+    binary: aistat
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+
+archives:
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: ["tar.gz"]
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+release:
+  github:
+    owner: drogers0
+    name: aistat
+  draft: false
+  prerelease: auto
