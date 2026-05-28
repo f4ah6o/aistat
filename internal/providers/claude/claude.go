@@ -30,8 +30,10 @@ const (
 	// refresh + usage for each account. The total budget is applied as a single
 	// context.WithTimeout over the whole per-account loop (pooled, not per-
 	// account), so a slow first account can starve later ones — acceptable as
-	// a v1 simplicity trade-off documented in D7.
-	perAccountBudget = 3 * time.Second
+	// a v1 simplicity trade-off documented in D7. The 15 s ceiling permits one
+	// max-length Retry-After: 10 sleep plus the actual fetch on attempts 1 + 2
+	// before sleepWithCtx's deadline check short-circuits a second sleep.
+	perAccountBudget = 15 * time.Second
 
 	// refreshSkew is the safety margin before ExpiresAt at which a stored
 	// token is considered near-expiry and proactively refreshed.
@@ -46,10 +48,12 @@ type Client struct {
 	refresh          *refreshClient
 	store            accounts.Store
 	readCredential   func(ctx context.Context) (cred.Credential, error)
-	warn             io.Writer  // receives per-run warn lines; defaults to os.Stderr in New
+	warn             io.Writer // receives per-run warn lines; defaults to os.Stderr in New
 	now              func() time.Time
 	baseTimeout      time.Duration
 	perAccountBudget time.Duration
+	cache            *usageCache // always non-nil; disabled state degrades to no-op
+	cacheBypass      bool        // skips the cache read path; writes still propagate (D8)
 }
 
 // Option mutates a Client at construction time.
@@ -63,6 +67,15 @@ func WithStore(s accounts.Store) Option { return func(c *Client) { c.store = s }
 // WithNow overrides the clock used to compute ResetAfterSeconds and the
 // token-expiry skew check. Defaults to time.Now. Intended for tests.
 func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn } }
+
+// WithCacheBypass bypasses the cache read path when true; writes still
+// propagate so the next invocation without bypass benefits from the fresh
+// result (D8 write-through contract). Has no effect when false (default).
+func WithCacheBypass(bypass bool) Option { return func(c *Client) { c.cacheBypass = bypass } }
+
+// CacheBypassEnabled reports whether the cache read path is bypassed.
+// Test-only seam; not part of the public API.
+func (c *Client) CacheBypassEnabled() bool { return c.cacheBypass }
 
 // New constructs a Client. debug receives [debug] lines when non-nil.
 // warn (distinct from debug) receives always-visible diagnostic lines; it
@@ -91,6 +104,8 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 	for _, o := range opts {
 		o(c)
 	}
+	// Initialize cache after options so WithNow's clock propagates into the cache.
+	c.cache = newUsageCache(c.now, func(s string) { c.warnf("%s\n", s) })
 	return c
 }
 
@@ -133,17 +148,19 @@ func (c *Client) readLiveCredential(ctx context.Context) (*cred.Credential, erro
 }
 
 // FetchUsage calls the usage endpoint with accessToken and returns the parsed
-// limits. Exposed so cmd/aistat/switch can read the currently-active account's
-// headroom for D13's "already on best" comparison without re-implementing the
-// window parser; FetchForSwitch returns only the non-active rows.
+// limits. No cache; always fresh. Exposed so cmd/aistat/switch can read the
+// currently-active account's headroom for D13's "already on best" comparison
+// without re-implementing the window parser; FetchForSwitch returns only the
+// non-active rows.
 func (c *Client) FetchUsage(ctx context.Context, accessToken string) (map[string]providers.Limit, error) {
-	return c.fetchLimits(ctx, accessToken)
+	return c.fetchLimitsFresh(ctx, accessToken)
 }
 
-// fetchLimits calls the usage endpoint with accessToken and returns the parsed
-// limits. ctx is expected to already carry the pool budget; perAccountBudget is
-// used as the per-call ceiling within that budget.
-func (c *Client) fetchLimits(ctx context.Context, accessToken string) (map[string]providers.Limit, error) {
+// fetchLimitsFresh calls the usage endpoint with accessToken and returns the
+// parsed limits. ctx is expected to already carry the pool budget;
+// perAccountBudget is used as the per-call ceiling within that budget.
+// No cache interaction; callers that want caching use fetchLimitsCached.
+func (c *Client) fetchLimitsFresh(ctx context.Context, accessToken string) (map[string]providers.Limit, error) {
 	var raw map[string]*window
 	if err := c.doer.GetJSON(ctx, c.endpoint, accessToken, c.perAccountBudget, &raw, httpx.DefaultClassify); err != nil {
 		return nil, err
@@ -177,6 +194,54 @@ func (c *Client) fetchLimits(ctx context.Context, accessToken string) (map[strin
 		}
 	}
 	return limits, nil
+}
+
+// fetchLimitsCached checks the usage cache first, falling through to
+// fetchLimitsFresh on miss. On a successful fresh fetch, writes through to
+// the cache even when cacheBypass is set (D8 write-through contract).
+// If uuid is empty (live-unstored fallback path), skips all cache interaction
+// and calls fetchLimitsFresh directly.
+func (c *Client) fetchLimitsCached(ctx context.Context, accessToken, uuid string) (map[string]providers.Limit, error) {
+	if uuid == "" {
+		return c.fetchLimitsFresh(ctx, accessToken)
+	}
+	if !c.cacheBypass {
+		if cached, age, ok := c.cache.getWithAge(uuid); ok {
+			cached = recomputeResetAfter(cached, c.now())
+			c.logCacheHit(uuid, age)
+			return cached, nil
+		}
+	}
+	limits, err := c.fetchLimitsFresh(ctx, accessToken)
+	if err == nil {
+		c.cache.Put(uuid, limits)
+	}
+	return limits, err
+}
+
+// recomputeResetAfter returns a new map with each Limit's ResetAfterSeconds
+// recomputed from its absolute ResetsAt against now. The input map is not
+// mutated — the cache stores absolute ResetsAt values; only the projection
+// into the current wall clock changes on each hit.
+func recomputeResetAfter(m map[string]providers.Limit, now time.Time) map[string]providers.Limit {
+	out := make(map[string]providers.Limit, len(m))
+	for k, l := range m {
+		secs := int(l.ResetsAt.Sub(now).Seconds())
+		if secs < 0 {
+			secs = 0
+		}
+		l.ResetAfterSeconds = secs
+		out[k] = l
+	}
+	return out
+}
+
+// logCacheHit emits one [debug] line on a usage cache hit.
+func (c *Client) logCacheHit(uuid string, age time.Duration) {
+	if c.doer.Debug != nil {
+		fmt.Fprintf(c.doer.Debug, "[debug] claude: usage cache hit for %s (age %ds)\n",
+			uuid, int(age.Seconds()))
+	}
 }
 
 // rotateRawBlob returns a copy of rawBlob with claudeAiOauth.accessToken,
@@ -277,10 +342,14 @@ func (c *Client) doReconcile(ctx context.Context) (*cred.Credential, ReconcileOu
 	// Step 5: persist before the usage fetches for crash robustness.
 	// Invariant: Reconcile sets Inserted/Upserted only for the active slot,
 	// so the UUID filter below always writes exactly the account that changed.
+	// Persistence stays best-effort (a write failure does not fail Fetch), but
+	// we warn so a deterministic store-write failure does not silently recur.
 	if out.Inserted || out.Upserted {
 		for _, acct := range out.Accounts {
 			if acct.UUID == out.ActiveUUID {
-				_ = c.store.Upsert(ctx, acct) // best-effort; next run self-corrects
+				if err := c.store.Upsert(ctx, acct); err != nil {
+					c.warnf("aistat: claude: could not persist account %s (uuid %s): %s\n", acct.Email, acct.UUID, err)
+				}
 				break
 			}
 		}
@@ -312,10 +381,10 @@ func (c *Client) ReconcileAndPersist(ctx context.Context) error {
 // (active-account compatibility projection per D3).
 //
 // Timeout budget: baseTimeout + len(accounts) × perAccountBudget, applied as a
-// single pool over the per-account loop (D7). A slow first account can starve
-// later accounts — accepted in v2.1.0. The orchestrator's outer context still
-// bounds total runtime, and its single-retry re-Fetches with the same parent
-// context so the computed budget re-applies on retry.
+// single pool over the per-account loop. A slow first account can starve later
+// accounts — accepted in v2.1.0. The parent context from the orchestrator
+// still bounds total runtime; the orchestrator does not retry (backoff lives
+// in httpx.Doer).
 //
 // ErrTransient is returned only when zero accounts succeeded AND at least one
 // failure was transient (D8 retry rule). Per-account errors that don't wipe out
@@ -337,7 +406,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	}
 
 	// Step 4: compute the pool timeout budget. Count the LiveUnstored synthetic
-	// row (if any) so its fetchLimits call has a slot in the budget.
+	// row (if any) so its fetchLimitsFresh call has a slot in the budget.
 	totalAccounts := len(reconcileOut.Accounts)
 	if reconcileOut.LiveUnstored != nil {
 		totalAccounts++
@@ -352,7 +421,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	// Step 6: if the live credential could not be reconciled to a stored slot
 	// (fallback case), prepend a synthetic in-memory row for the live account.
 	if reconcileOut.LiveUnstored != nil {
-		limits, fetchErr := c.fetchLimits(poolCtx, reconcileOut.LiveUnstored.AccessToken)
+		limits, fetchErr := c.fetchLimitsFresh(poolCtx, reconcileOut.LiveUnstored.AccessToken)
 		ar := providers.AccountResult{
 			Email:  "(live Claude account)",
 			UUID:   "",
@@ -396,7 +465,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 			}
 		}
 
-		limits, fetchErr := c.fetchLimits(poolCtx, acct.AccessToken())
+		limits, fetchErr := c.fetchLimitsCached(poolCtx, acct.AccessToken(), acct.UUID)
 		if ok, trans := recordFetchOutcome(&ar, limits, fetchErr); ok {
 			successCount++
 		} else if trans {
@@ -426,8 +495,10 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 }
 
 // FetchForSwitch is read-only against the live keychain and the multi-account
-// store. It performs no token refresh and no Upsert. For each non-active stored
-// account it calls the usage endpoint with the stored access token verbatim.
+// store. It performs no token refresh and no Upsert. No cache; always fresh —
+// auto-pick decisions need current headroom because a stale five_hour figure
+// can be wrong by a window reset. For each non-active stored account it calls
+// the usage endpoint with the stored access token verbatim.
 //
 // If the call returns ErrAuthDenied (the stored access token has typically
 // expired), the account is excluded from the returned slice and a per-account
@@ -473,7 +544,7 @@ func (c *Client) FetchForSwitch(ctx context.Context) ([]providers.AccountResult,
 
 	var results []providers.AccountResult
 	for _, acct := range nonActive {
-		limits, fetchErr := c.fetchLimits(poolCtx, acct.AccessToken())
+		limits, fetchErr := c.fetchLimitsFresh(poolCtx, acct.AccessToken())
 		if fetchErr != nil {
 			if errors.Is(fetchErr, providers.ErrAuthDenied) {
 				c.warnf("aistat: claude: %s: stored credential rejected (run `aistat usage` to refresh); excluded from auto-pick\n", acct.Email)

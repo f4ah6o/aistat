@@ -2,7 +2,6 @@ package orchestrate
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -12,12 +11,9 @@ import (
 	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
-const retryBackoff = 200 * time.Millisecond
-
 type Options struct {
-	Now          func() time.Time
-	Debug        io.Writer
-	RetryBackoff time.Duration // zero defaults to retryBackoff; injectable for tests
+	Now   func() time.Time
+	Debug io.Writer
 }
 
 type ExitStatus int
@@ -29,22 +25,19 @@ const (
 	StatusRenderError ExitStatus = 3
 )
 
-// Run fetches every requested provider concurrently, retries each once on
-// transient failure, and assembles a Report.
+// Run fetches every requested provider concurrently and assembles a Report.
+// Transient failures are retried inside the HTTP layer (httpx.Doer), not here;
+// each provider's Fetch is invoked exactly once per Run.
 //
-// Exit-status rule (D8):
+// Exit-status rule:
 //   - StatusOK (0): every requested provider produced a result without a
 //     provider-level error. Per-account errors inside Accounts — which surface
 //     in JSON — do not flip the exit code; the provider as a whole succeeded.
 //   - StatusAnyFailed (1): at least one provider's Fetch returned a non-nil
-//     error after any applicable retry. When Fetch returns an error alongside
-//     a non-empty ProviderOutput.Accounts, those rows are preserved in the
-//     result so callers see the partial information the provider gathered
-//     before deciding the overall fetch had failed.
-//
-// The Claude provider is responsible for returning ErrTransient iff zero
-// accounts succeeded AND at least one account failure was transient; the
-// orchestrator simply consumes that signal to trigger the single retry.
+//     error. When Fetch returns an error alongside a non-empty
+//     ProviderOutput.Accounts, those rows are preserved in the result so
+//     callers see the partial information the provider gathered before
+//     deciding the overall fetch had failed.
 func Run(ctx context.Context, requested []string, all []providers.Provider, opts Options) (providers.Report, ExitStatus) {
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -52,11 +45,6 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 	byID := map[string]providers.Provider{}
 	for _, p := range all {
 		byID[p.ID()] = p
-	}
-
-	backoff := opts.RetryBackoff
-	if backoff == 0 {
-		backoff = retryBackoff
 	}
 
 	checkedAt := opts.Now().UTC().Truncate(time.Second)
@@ -78,7 +66,7 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 		wg.Add(1)
 		go func(p providers.Provider) {
 			defer wg.Done()
-			out, err := fetchWithRetry(ctx, p, opts.Debug, backoff)
+			out, err := fetchOnce(ctx, p, opts.Debug)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -104,34 +92,11 @@ func Run(ctx context.Context, requested []string, all []providers.Provider, opts
 	return providers.Report{CheckedAt: checkedAt, Providers: results}, status
 }
 
-// fetchWithRetry retries once on ErrTransient. Before broadening this
-// policy (e.g. retry on additional classifications, scheduled backoff),
-// see the doc on httpx.DefaultClassify — GitHub 403 rate-limits today
-// misclassify as ErrAuthDenied and would need the Classifier signature
-// widened to *http.Response so X-RateLimit-* / Retry-After can inform
-// the decision.
-func fetchWithRetry(ctx context.Context, p providers.Provider, debug io.Writer, backoff time.Duration) (providers.ProviderOutput, error) {
-	out, err := fetchOnce(ctx, p, debug, false)
-	if errors.Is(err, providers.ErrTransient) {
-		select {
-		case <-time.After(backoff):
-		case <-ctx.Done():
-			return providers.ProviderOutput{}, ctx.Err()
-		}
-		out, err = fetchOnce(ctx, p, debug, true)
-	}
-	return out, err
-}
-
-func fetchOnce(ctx context.Context, p providers.Provider, debug io.Writer, retry bool) (providers.ProviderOutput, error) {
+func fetchOnce(ctx context.Context, p providers.Provider, debug io.Writer) (providers.ProviderOutput, error) {
 	start := time.Now()
 	out, err := p.Fetch(ctx)
 	elapsed := time.Since(start)
 	if debug != nil {
-		suffix := ""
-		if retry {
-			suffix = " [retry]"
-		}
 		outcome := "ok"
 		if err != nil {
 			// Sanitize: err.Error() may include an upstream Snip body with
@@ -140,9 +105,9 @@ func fetchOnce(ctx context.Context, p providers.Provider, debug io.Writer, retry
 			outcome = httpx.SanitizeDebugLine(err.Error())
 		}
 		// Per-request URL detail comes from httpx.Doer. This summary line
-		// names the provider, total elapsed time, and (when applicable) the
-		// retry marker so a user can correlate against the underlying GET.
-		fmt.Fprintf(debug, "[debug] %s: %s (%dms)%s\n", p.ID(), outcome, elapsed.Milliseconds(), suffix)
+		// names the provider and total elapsed time so a user can correlate
+		// against the underlying GET.
+		fmt.Fprintf(debug, "[debug] %s: %s (%dms)\n", p.ID(), outcome, elapsed.Milliseconds())
 	}
 	return out, err
 }

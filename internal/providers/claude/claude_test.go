@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -96,6 +97,9 @@ func refreshSuccessBody(accessToken, refreshToken string) []byte {
 // buildClient constructs a Client for testing. Each component (usage, profile,
 // refresh) uses its own doer so each can point at a separate test server.
 // If warnBuf is nil, warns are discarded. If nowFn is nil, testNow is used.
+//
+// Cache isolation: sets HOME (and clears XDG_CACHE_HOME) to a per-test
+// TempDir so no test touches the developer's real cache directory.
 func buildClient(
 	t *testing.T,
 	usageSrv *httptest.Server,
@@ -107,6 +111,10 @@ func buildClient(
 	nowFn func() time.Time,
 ) *Client {
 	t.Helper()
+
+	// Isolate cache I/O from the developer's real cache directory.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
 
 	usageDoer := httpx.NewDoer(usageSrv.Client(), "aistat-test/0", "claude",
 		map[string]string{"Anthropic-Beta": betaHeader}, nil)
@@ -138,6 +146,8 @@ func buildClient(
 		return *liveCred, nil
 	}
 
+	warnFn := func(s string) { fmt.Fprintln(warnBuf, s) }
+
 	return &Client{
 		doer:             usageDoer,
 		endpoint:         usageSrv.URL + "/api/oauth/usage",
@@ -149,6 +159,7 @@ func buildClient(
 		now:              nowFn,
 		baseTimeout:      10 * time.Second,
 		perAccountBudget: 3 * time.Second,
+		cache:            newUsageCache(nowFn, warnFn),
 	}
 }
 
@@ -602,14 +613,19 @@ func TestFetch_MixedTransientAndAuthDenied(t *testing.T) {
 	_ = store.Upsert(context.Background(), acctA)
 	_ = store.Upsert(context.Background(), acctB)
 
-	// The MemoryStore List returns accounts in map-iteration order (non-deterministic),
-	// so we make both response types consistent with the D8 retry rule regardless of
-	// which account is fetched first. We use a sequential server that alternates.
+	// The MemoryStore List returns accounts in map-iteration order (non-deterministic).
+	// The httpx retry layer retries transient errors up to maxAttempts=3 times, so
+	// the transient account (whichever is fetched first) consumes 3 sequential 503s
+	// before the httpx loop gives up and returns ErrTransient to Fetch. The auth-denied
+	// account then receives the repeated 401 last entry. Update the response count if
+	// httpx.maxAttempts changes.
 	usageSrv := stubSequentialServer(t, []struct {
 		status int
 		body   []byte
 	}{
 		{503, []byte(`{"error":"unavailable"}`)},
+		{503, []byte(`{"error":"unavailable"}`)},
+		{503, []byte(`{"error":"unavailable"}`)}, // 3 = httpx.maxAttempts
 		{401, []byte(`{"error":"unauthorized"}`)},
 	})
 	profileSrv := noProfileServer(t)
@@ -994,13 +1010,19 @@ func TestFetch_ThreeAccount_MixedForErrTransientRule(t *testing.T) {
 	_ = store.Upsert(context.Background(), makeAccount("uuid-b", "b@example.com", "tok-b", "ref-b", 0))
 	_ = store.Upsert(context.Background(), makeAccount("uuid-c", "c@example.com", "tok-c", "ref-c", 0))
 
-	// 2 transient, 1 auth-denied — in any order.
+	// 2 transient accounts × maxAttempts=3 each = 6 consecutive 503s; the 3rd
+	// account (whichever it is in non-deterministic map order) receives the repeated
+	// 401 last entry. Update the response count if httpx.maxAttempts changes.
 	usageSrv := stubSequentialServer(t, []struct {
 		status int
 		body   []byte
 	}{
 		{503, []byte(`{"error":"down"}`)},
 		{503, []byte(`{"error":"down"}`)},
+		{503, []byte(`{"error":"down"}`)},
+		{503, []byte(`{"error":"down"}`)},
+		{503, []byte(`{"error":"down"}`)},
+		{503, []byte(`{"error":"down"}`)}, // 6 = 2 accounts × httpx.maxAttempts(3)
 		{401, []byte(`{"error":"unauthorized"}`)},
 	})
 	profileSrv := noProfileServer(t)
@@ -1117,5 +1139,431 @@ func TestFetch_RotateExpiresAtZero(t *testing.T) {
 	// expiresAt must be 0, not the old nearExpiry value.
 	if got := stored[0].ExpiresAt(); got != 0 {
 		t.Errorf("stored ExpiresAt = %d, want 0 (no expiry from server)", got)
+	}
+}
+
+// ── cache integration tests ──────────────────────────────────────────────────
+
+// TestFetch_TwoAccount_CacheHit: pre-populate cache for acct A; run Fetch;
+// assert the usage server saw a request only for acct B.
+func TestFetch_TwoAccount_CacheHit(t *testing.T) {
+	acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
+	acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acctA)
+	_ = store.Upsert(context.Background(), acctB)
+
+	live := makeCred("tok-a", "ref-a", 0) // byte-matches acctA
+
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
+
+	// Pre-populate cache for acctA — only acctB should fire a fresh request.
+	c.cache.Put("uuid-a", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 30, RemainingPercent: 70, ResetsAt: testNow.Add(time.Hour), ResetAfterSeconds: 3600},
+	})
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := usageCount.Load(); n != 1 {
+		t.Errorf("usage server requests = %d, want 1 (only acctB should fire)", n)
+	}
+	if len(out.Accounts) != 2 {
+		t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
+	}
+	// Active account (acctA) should have limits from the cache (no error).
+	for _, ar := range out.Accounts {
+		if ar.UUID == "uuid-a" && ar.Error != "" {
+			t.Errorf("acctA (cache hit) should have no error, got: %q", ar.Error)
+		}
+	}
+}
+
+// TestFetch_TwoAccount_CacheExpiredBothFire: pre-populate cache with entries
+// older than TTL; assert the usage server saw requests for both accounts.
+func TestFetch_TwoAccount_CacheExpiredBothFire(t *testing.T) {
+	t.Setenv("AISTAT_USAGE_CACHE_TTL", "1s")
+
+	acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
+	acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acctA)
+	_ = store.Upsert(context.Background(), acctB)
+
+	now := testNow
+	nowFn := func() time.Time { return now }
+	live := makeCred("tok-a", "ref-a", 0)
+
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nowFn)
+
+	c.cache.Put("uuid-a", map[string]providers.Limit{"five_hour": {ResetsAt: now.Add(time.Hour)}})
+	c.cache.Put("uuid-b", map[string]providers.Limit{"five_hour": {ResetsAt: now.Add(time.Hour)}})
+
+	// Advance clock past the 1 s TTL.
+	now = now.Add(2 * time.Second)
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := usageCount.Load(); n != 2 {
+		t.Errorf("usage server requests = %d, want 2 (both entries expired)", n)
+	}
+	if len(out.Accounts) != 2 {
+		t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
+	}
+}
+
+// TestFetch_CacheHitRecomputesResetAfter: cached Limit.ResetsAt is absolute;
+// ResetAfterSeconds is recomputed from the current clock on every cache hit.
+func TestFetch_CacheHitRecomputesResetAfter(t *testing.T) {
+	// Use a 90 s TTL so a 40 s clock advance does not expire the entry.
+	t.Setenv("AISTAT_USAGE_CACHE_TTL", "90s")
+
+	acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acct)
+	live := makeCred("tok-a", "ref-a", 0)
+
+	now := testNow
+	nowFn := func() time.Time { return now }
+
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nowFn)
+
+	// Put at T with ResetsAt = T + 60s; ResetAfterSeconds stored as 60.
+	resetsAt := now.Add(60 * time.Second)
+	c.cache.Put("uuid-a", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 50, RemainingPercent: 50, ResetsAt: resetsAt, ResetAfterSeconds: 60},
+	})
+
+	// Advance clock to T + 40s; expect ResetAfterSeconds = 20 on cache hit.
+	now = now.Add(40 * time.Second)
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if usageCount.Load() != 0 {
+		t.Errorf("usage server should not be hit on cache hit, got %d requests", usageCount.Load())
+	}
+	if len(out.Accounts) != 1 {
+		t.Fatalf("Accounts len = %d, want 1", len(out.Accounts))
+	}
+	fh, ok := out.Accounts[0].Limits["five_hour"]
+	if !ok {
+		t.Fatal("five_hour limit missing")
+	}
+	if fh.ResetAfterSeconds != 20 {
+		t.Errorf("ResetAfterSeconds = %d, want 20 (recomputed from cached ResetsAt)", fh.ResetAfterSeconds)
+	}
+	// ResetsAt must be preserved unchanged.
+	if !fh.ResetsAt.Equal(resetsAt) {
+		t.Errorf("ResetsAt = %v, want %v", fh.ResetsAt, resetsAt)
+	}
+}
+
+// TestFetch_LiveUnstoredBypassesCache: the live-unstored fallback path (no UUID)
+// always calls fetchLimitsFresh regardless of cache state.
+func TestFetch_LiveUnstoredBypassesCache(t *testing.T) {
+	live := makeCred("tok-live", "ref-live", 0)
+	// Empty store → no byte-match → profile call needed.
+	store := accounts.NewMemoryStore()
+
+	// Profile returns 503 → LiveUnstored branch (no UUID available).
+	profileSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	refreshSrv := noRefreshServer(t)
+
+	var warnBuf bytes.Buffer
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, &warnBuf, nil)
+
+	// Pre-populate cache for some UUID — fallback path has no UUID and should
+	// bypass the cache entirely.
+	c.cache.Put("some-uuid", map[string]providers.Limit{"five_hour": {ResetAfterSeconds: 999}})
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if usageCount.Load() != 1 {
+		t.Errorf("usage server requests = %d, want 1 (fresh fetch required, no UUID)", usageCount.Load())
+	}
+	if len(out.Accounts) != 1 || out.Accounts[0].Email != "(live Claude account)" {
+		t.Errorf("expected fallback row, got: %+v", out.Accounts)
+	}
+}
+
+// TestFetch_RotatedTokenSharesCacheEntry: after a token rotation, fetchLimitsCached
+// still keys on UUID (unchanged), so a pre-populated cache entry produces a hit
+// without any usage server requests.
+func TestFetch_RotatedTokenSharesCacheEntry(t *testing.T) {
+	nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
+	acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acct)
+	live := makeCred("tok-a", "ref-a", nearExpiry) // byte-matches
+
+	refreshSrv := stubStaticServer(t, 200, refreshSuccessBody("tok-a2", "ref-a2"))
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
+		nil, func() time.Time { return testNow })
+
+	// Pre-populate cache for uuid-a with original limits.
+	originalResetsAt := testNow.Add(time.Hour)
+	c.cache.Put("uuid-a", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 20, RemainingPercent: 80, ResetsAt: originalResetsAt, ResetAfterSeconds: 3600},
+	})
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Token was rotated (refresh fired) but UUID is unchanged → cache hit.
+	if n := usageCount.Load(); n != 0 {
+		t.Errorf("usage server requests = %d, want 0 (cache hit despite token rotation)", n)
+	}
+	if len(out.Accounts) != 1 {
+		t.Fatalf("Accounts len = %d, want 1", len(out.Accounts))
+	}
+	if out.Accounts[0].Error != "" {
+		t.Errorf("account should have no error on cache hit, got: %q", out.Accounts[0].Error)
+	}
+}
+
+// TestFetch_CacheMiss429HonorsRetryAfterWithinBudget: a cache miss triggers a
+// live fetch; the first response is 429 Retry-After: 1; the second succeeds.
+// The account should still produce limits within the 3 s per-account budget.
+func TestFetch_CacheMiss429HonorsRetryAfterWithinBudget(t *testing.T) {
+	acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acct)
+	live := makeCred("tok-a", "ref-a", 0)
+
+	var callCount atomic.Int32
+	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := int(callCount.Add(1))
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(429)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write(minUsageBody)
+	}))
+	t.Cleanup(usageSrv.Close)
+
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("expected success after retry, got: %v", err)
+	}
+	if n := callCount.Load(); n != 2 {
+		t.Errorf("usage server calls = %d, want 2 (retry after 429)", n)
+	}
+	if len(out.Accounts) == 0 || out.Accounts[0].Error != "" {
+		t.Errorf("account should succeed after retry; error = %q", out.Accounts[0].Error)
+	}
+}
+
+// TestFetch_CacheMissRepeatedRetryAfterExceedsBudget: when the server returns
+// 429 Retry-After: 2 on every attempt, and the pool budget (baseTimeout=0,
+// perAccountBudget=3 s) means the second sleep would exceed the deadline,
+// sleepWithCtx skips the second sleep → exactly 2 attempts → ErrTransient.
+func TestFetch_CacheMissRepeatedRetryAfterExceedsBudget(t *testing.T) {
+	acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acct)
+	live := makeCred("tok-a", "ref-a", 0)
+
+	// Redirect cache to an isolated dir before constructing the cache.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+
+	nowFn := func() time.Time { return testNow }
+
+	var callCount atomic.Int32
+	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	t.Cleanup(usageSrv.Close)
+
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	usageDoer := httpx.NewDoer(usageSrv.Client(), "aistat-test/0", "claude",
+		map[string]string{"Anthropic-Beta": betaHeader}, nil)
+	profDoer := httpx.NewDoer(profileSrv.Client(), "aistat-test/0", "claude",
+		map[string]string{"Anthropic-Beta": betaHeader}, nil)
+	pc := newProfileClient(profDoer)
+	pc.endpoint = profileSrv.URL + "/api/oauth/profile"
+	refDoer := httpx.NewDoer(refreshSrv.Client(), "aistat-test/0", "claude", nil, nil)
+	rc := newRefreshClient(refDoer)
+	rc.endpoint = refreshSrv.URL + "/v1/oauth/token"
+	rc.now = nowFn
+
+	c := &Client{
+		doer:             usageDoer,
+		endpoint:         usageSrv.URL + "/api/oauth/usage",
+		profile:          pc,
+		refresh:          rc,
+		store:            store,
+		readCredential:   func(context.Context) (cred.Credential, error) { return *live, nil },
+		warn:             io.Discard,
+		now:              nowFn,
+		baseTimeout:      0,              // no base buffer: pool = just perAccountBudget
+		perAccountBudget: 3 * time.Second, // 0+3=3 s pool; 2nd Retry-After:2 sleep (0+2+2=4 s) exceeds it
+		cache:            newUsageCache(nowFn, func(string) {}),
+	}
+
+	start := time.Now()
+	out, err := c.Fetch(context.Background())
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, providers.ErrTransient) {
+		t.Errorf("expected ErrTransient, got: %v", err)
+	}
+	if n := callCount.Load(); n != 2 {
+		t.Errorf("usage server calls = %d, want 2 (second sleep skipped by budget check)", n)
+	}
+	if elapsed > 4*time.Second {
+		t.Errorf("test took %v, want < 4s (should not sleep a second 2s delay)", elapsed)
+	}
+	if len(out.Accounts) == 0 || out.Accounts[0].Error == "" {
+		t.Error("account should carry per-account ErrTransient error")
+	}
+}
+
+// TestFetchForSwitch_BypassesCache: pre-populate cache; FetchForSwitch still
+// hits the usage server for every non-active account (no cache).
+func TestFetchForSwitch_BypassesCache(t *testing.T) {
+	activeAcct := makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0)
+	otherAcct := makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), activeAcct)
+	_ = store.Upsert(context.Background(), otherAcct)
+
+	live := makeCred("tok-active", "ref-active", 0)
+
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
+
+	// Pre-populate cache for the non-active account.
+	c.cache.Put("uuid-other", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 10, RemainingPercent: 90, ResetsAt: testNow.Add(time.Hour)},
+	})
+
+	results, err := c.FetchForSwitch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("FetchForSwitch returned %d results, want 1", len(results))
+	}
+	if n := usageCount.Load(); n != 1 {
+		t.Errorf("usage server requests = %d, want 1 (FetchForSwitch bypasses cache)", n)
+	}
+}
+
+// TestFetchUsage_BypassesCache: pre-populate cache; FetchUsage still hits
+// the usage server (no cache).
+func TestFetchUsage_BypassesCache(t *testing.T) {
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil)
+
+	// Pre-populate cache for some UUID.
+	c.cache.Put("uuid-x", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 5, RemainingPercent: 95, ResetsAt: testNow.Add(time.Hour)},
+	})
+
+	_, err := c.FetchUsage(context.Background(), "tok-test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := usageCount.Load(); n != 1 {
+		t.Errorf("usage server requests = %d, want 1 (FetchUsage always fresh)", n)
+	}
+}
+
+// TestNew_WithCacheBypass: WithCacheBypass(true) skips the read path (usage
+// server IS hit) but still writes through on success (D8 contract).
+func TestNew_WithCacheBypass(t *testing.T) {
+	// Verify WithCacheBypass actually wires the field through New.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
+	optClient := New(nil, "aistat-test/0", WithCacheBypass(true))
+	if !optClient.cacheBypass {
+		t.Fatal("WithCacheBypass(true) did not set cacheBypass on Client")
+	}
+
+	acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
+	store := accounts.NewMemoryStore()
+	_ = store.Upsert(context.Background(), acct)
+	live := makeCred("tok-a", "ref-a", 0)
+
+	usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
+	profileSrv := noProfileServer(t)
+	refreshSrv := noRefreshServer(t)
+
+	c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
+
+	// Pre-populate cache for uuid-a.
+	c.cache.Put("uuid-a", map[string]providers.Limit{
+		"five_hour": {UsedPercent: 99, RemainingPercent: 1, ResetsAt: testNow.Add(time.Hour)},
+	})
+
+	// Enable bypass: read path should be skipped even though cache has an entry.
+	c.cacheBypass = true
+
+	out, err := c.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Bypass skips read → usage server must be hit.
+	if n := usageCount.Load(); n != 1 {
+		t.Errorf("usage server requests = %d, want 1 (bypass skips cache read)", n)
+	}
+	// Write-through: cache entry should be updated with the fresh result.
+	if _, ok := c.cache.Get("uuid-a"); !ok {
+		t.Error("cache should have entry for uuid-a after write-through on bypass")
+	}
+	// Account should reflect the fresh server data (minUsageBody has 50% utilization),
+	// not the stale 99% cached entry.
+	if len(out.Accounts) == 0 || out.Accounts[0].Error != "" {
+		t.Errorf("account should succeed; error = %q", out.Accounts[0].Error)
+	}
+	if len(out.Accounts) > 0 {
+		fh := out.Accounts[0].Limits["five_hour"]
+		if fh.UsedPercent == 99 {
+			t.Error("UsedPercent should be from fresh server data, not stale cache")
+		}
 	}
 }

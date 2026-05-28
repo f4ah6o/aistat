@@ -15,6 +15,9 @@ import (
 // api.anthropic.com. Opt-in: `go test -tags live ./internal/providers/claude`.
 // Confirms the live response still parses to >0 limits.
 func TestLive_RealKeychainAndEndpoint(t *testing.T) {
+	// Isolate cache writes from the developer's real cache directory.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
 	c := New(nil, "aistat-live-test/0")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -43,6 +46,9 @@ func TestLive_MultiAccount(t *testing.T) {
 		t.Skip("skipping live multi-account smoke test in short mode")
 	}
 
+	// Isolate cache writes from the developer's real cache directory.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", "")
 	c := New(nil, "aistat-live-test/0")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

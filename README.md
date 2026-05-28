@@ -49,6 +49,7 @@ aistat switch --to <email|uuid>   # switch to a specific stored claude account
 aistat accounts list              # list stored claude accounts
 aistat accounts remove <id>       # remove a stored claude account (by email substring or uuid prefix)
 
+aistat usage --refresh            # bypass the 30s per-account cache; force a fresh read
 aistat -h, --human                # render human-readable text (affects `usage` only)
 aistat --debug                    # per-request + per-provider lines on stderr
 aistat --version                  # print version and exit
@@ -99,7 +100,21 @@ Each provider has one credential source and a small set of HTTPS endpoints:
 
 Providers are fetched in parallel. A failing provider does not block the others; each failed provider's error message is surfaced in the JSON (`providers.<id>.error`) and as `<Cap> usage: <error>` in text mode. See [Exit codes](#exit-codes) below.
 
-For multi-account Claude, the per-account fetches run sequentially within the Claude provider with a dynamic timeout budget of `10s + 3s × N` where N is the number of stored accounts. A single transient failure on one of several accounts does not flip the overall exit code — it's surfaced as a per-account error in the JSON and the next run resolves it.
+For multi-account Claude, the per-account fetches run sequentially within the Claude provider with a dynamic timeout budget of `10s + 15s × N` where N is the number of stored accounts. A single transient failure on one of several accounts does not flip the overall exit code — it's surfaced as a per-account error in the JSON and the next run resolves it.
+
+### Caching
+
+`aistat usage` caches each Claude account's usage response for 30 seconds, keyed by `account.uuid`, at `$CACHE/aistat/usage/claude-v1.json` (macOS: `~/Library/Caches/aistat/usage/claude-v1.json`). This absorbs back-to-back invocations from scripts and interactive testing without adding load to Anthropic's per-token rate limit. Future format changes land under a new filename (e.g. `claude-v2.json`); older binaries keep using their own `-v1.json` with no interference.
+
+To skip the cache and force a fresh read: `aistat usage --refresh`. The cache is rewritten with the fresh result either way, so the next invocation without the flag still benefits.
+
+`aistat switch` never reads the cache — auto-pick decisions need current data, since near a window reset a stale `five_hour` figure can cross a rollover discontinuity. The cache is keyed by `account.uuid` (not by which account is currently live), so right after `aistat switch` a subsequent `aistat usage` for the now-active account may serve a still-valid cached entry from before the switch (within the 30s TTL). Pass `--refresh` if you want a fresh read post-switch.
+
+Override the TTL with the `AISTAT_USAGE_CACHE_TTL` env var (e.g. `AISTAT_USAGE_CACHE_TTL=10s`). The default is intentionally conservative. If the cache can't be set up (read-only home, permission denied), it emits a one-time warn on stderr and stays disabled for the rest of the process; `aistat usage` proceeds without caching. A corrupt or truncated file recovers on the next successful fetch — the `Put` overwrites it via atomic rename.
+
+### Reliability
+
+Transient HTTP failures (HTTP 408, 429, 5xx, network errors) are retried up to 3 times per request inside `httpx.Doer`, honoring `Retry-After` (capped at 10s) when present and falling back to exponential backoff with ±20% jitter otherwise. The orchestrator does not add an additional outer retry; the HTTP layer's bounded inner retries are the only retry path. Sleeps that would exceed the per-account budget are skipped (returning the last error early) so the CLI doesn't block longer than the 15s per-account ceiling.
 
 ### Exit codes
 

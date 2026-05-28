@@ -175,3 +175,67 @@ func TestDarwinStore_ConcurrentUpserts(t *testing.T) {
 		t.Errorf("want both UUIDs present after concurrent upserts; got: %v", list)
 	}
 }
+
+// TestDarwinStore_IndexGrowsAndShrinks pins the regression where the second
+// and later Upserts (and any non-emptying Delete) failed to update the index
+// because darwinWriteItem called `security add-generic-password` without -U.
+// Sequential (not concurrent) so the failure mode is deterministic, and
+// explicit error checks on every mutation so the bug cannot hide behind
+// ignored return values. Covers both directions: Upsert grows the index,
+// Delete shrinks it (the underlying defect was symmetric).
+func TestDarwinStore_IndexGrowsAndShrinks(t *testing.T) {
+	skipUnlessLive(t)
+
+	uuid1 := "aistat-test-grow1-0000-0000-0000-000000000006"
+	uuid2 := "aistat-test-grow2-0000-0000-0000-000000000007"
+	t.Cleanup(func() {
+		forceDeleteSentinel(uuid1)
+		forceDeleteSentinel(uuid2)
+	})
+
+	s, err := OpenStore()
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := s.Upsert(ctx, makeTestAccount(uuid1, "grow1@example.com")); err != nil {
+		t.Fatalf("Upsert 1: %v", err)
+	}
+	if err := s.Upsert(ctx, makeTestAccount(uuid2, "grow2@example.com")); err != nil {
+		t.Fatalf("Upsert 2: %v", err)
+	}
+
+	list, err := s.List(ctx)
+	if err != nil {
+		t.Fatalf("List after upserts: %v", err)
+	}
+	found := map[string]bool{}
+	for _, a := range list {
+		found[a.UUID] = true
+	}
+	if !found[uuid1] || !found[uuid2] {
+		t.Fatalf("want both UUIDs present after sequential upserts; got: %v", list)
+	}
+
+	// Delete uuid1 — index post-filter is non-empty ([uuid2]), so the writeIndex
+	// inside Delete exercises the same upsert path the bug lived in.
+	if err := s.Delete(ctx, uuid1); err != nil {
+		t.Fatalf("Delete uuid1: %v", err)
+	}
+
+	list, err = s.List(ctx)
+	if err != nil {
+		t.Fatalf("List after delete: %v", err)
+	}
+	found = map[string]bool{}
+	for _, a := range list {
+		found[a.UUID] = true
+	}
+	if found[uuid1] {
+		t.Errorf("uuid1 should be gone after delete; got: %v", list)
+	}
+	if !found[uuid2] {
+		t.Errorf("uuid2 should still be present after deleting uuid1; got: %v", list)
+	}
+}

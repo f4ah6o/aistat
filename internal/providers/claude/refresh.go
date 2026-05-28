@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -129,7 +130,8 @@ func (r *refreshClient) Exchange(ctx context.Context, refreshToken string) (Toke
 // refreshClassify maps token-endpoint non-200 responses to errors.
 // invalid_grant → ErrRefreshRejected; 404 → ErrRefreshEndpointBroken;
 // transient statuses → ErrTransient; other 4xx → bare error.
-func refreshClassify(endpointURL string, status int, body []byte) error {
+func refreshClassify(endpointURL string, resp *http.Response, body []byte) error {
+	status := resp.StatusCode
 	if status == 400 {
 		var errResp tokenErrorWire
 		if json.Unmarshal(body, &errResp) == nil && errResp.Error == "invalid_grant" {

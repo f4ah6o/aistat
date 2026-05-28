@@ -24,7 +24,7 @@ import (
 // gated on --debug, so the user sees keychain breakage) and a MemoryStore
 // is used as a safe no-op fallback: List returns empty, Upsert/Delete are
 // no-ops for this run, but the live credential still drives a usable result.
-func realProviders(serialStderr *httpx.ConcurrencySafeWriter, includeDebug bool) []providers.Provider {
+func realProviders(serialStderr *httpx.ConcurrencySafeWriter, includeDebug bool, cacheBypass bool) []providers.Provider {
 	var debugSink io.Writer
 	if includeDebug {
 		debugSink = serialStderr
@@ -42,7 +42,7 @@ func realProviders(serialStderr *httpx.ConcurrencySafeWriter, includeDebug bool)
 
 	ua := userAgent()
 	return []providers.Provider{
-		claude.New(debugSink, ua, claude.WithStore(store)),
+		claude.New(debugSink, ua, claude.WithStore(store), claude.WithCacheBypass(cacheBypass)),
 		codex.New(debugSink, ua),
 		copilot.New(debugSink, ua, copilot.WithWarn(wrapWarn(serialStderr))),
 	}
@@ -64,13 +64,14 @@ func wrapWarn(out io.Writer) func(string) {
 func buildProviders(
 	serialStderr *httpx.ConcurrencySafeWriter,
 	includeDebug bool,
+	cacheBypass bool,
 	fakeFn func() []providers.Provider,
 ) (chosen []providers.Provider, orchDebug io.Writer) {
 	if fakeFn != nil {
 		chosen = fakeFn()
 	}
 	if chosen == nil {
-		chosen = realProviders(serialStderr, includeDebug)
+		chosen = realProviders(serialStderr, includeDebug, cacheBypass)
 	}
 	if includeDebug {
 		orchDebug = serialStderr

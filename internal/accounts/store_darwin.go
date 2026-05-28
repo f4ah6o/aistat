@@ -145,15 +145,16 @@ func darwinReadAccountItem(ctx context.Context, uuid string) ([]byte, error) {
 	return []byte(data), nil
 }
 
-// upsertAccountItem writes the Account JSON as a new keychain item, replacing
-// any existing item for the same UUID service name. Delete-then-create handles
-// identity-drift email changes (D9): since keychain uniqueness is (service,
-// account), a -U update with a changed email would create a duplicate; deleting
-// first avoids that.
+// upsertAccountItem writes the Account JSON as the per-account keychain item.
+// See darwinWriteItem below for the `-U` upsert semantics. The explicit
+// pre-delete here is NOT redundant after `-U`: it is required for D9 identity
+// drift, where a stored UUID's email may change. `-U` matches by (service,
+// account), so a changed email would miss the existing row and silently
+// insert a duplicate. The pre-delete by service only removes the old row first.
 //
-// Failure mode: if the delete succeeds but the subsequent add fails, the
-// per-account item is gone while the UUID may still be in the index.
-// List will surface this as an orphan-in-index warn (aistat: orphan account
+// Failure mode: if the pre-delete succeeds but the subsequent add fails, the
+// per-account item is gone while the UUID may still be in the index. List
+// will surface this as an orphan-in-index warn (aistat: orphan account
 // index entry <uuid>). The next Upsert call recreates the item cleanly.
 func upsertAccountItem(ctx context.Context, a Account) error {
 	svc := darwinServicePrefix + a.UUID
@@ -165,11 +166,18 @@ func upsertAccountItem(ctx context.Context, a Account) error {
 	return darwinWriteItem(ctx, svc, a.Email, string(mustMarshal(a)))
 }
 
-// darwinWriteItem calls `security add-generic-password` with the given service,
-// account, and value.
+// darwinWriteItem calls `security add-generic-password -U`, which creates the
+// item if it does not exist and updates the value in place if it does. The -U
+// flag matches by (service, account); callers that need to handle a change to
+// either of those uniqueness fields must delete-then-add explicitly (see
+// upsertAccountItem for the D9 identity-drift case where email may change).
+//
+// Without -U the call would exit 45 ("item already exists") on every write
+// after the first to the same (service, account) — the historical bug that
+// silently dropped index updates after the first Upsert.
 func darwinWriteItem(ctx context.Context, service, account, value string) error {
 	cmd := exec.CommandContext(ctx, "security", "add-generic-password",
-		"-s", service, "-a", account, "-w", value)
+		"-U", "-s", service, "-a", account, "-w", value)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("keychain write %s/%s: %s", service, account,
 			strings.TrimSpace(string(out)))

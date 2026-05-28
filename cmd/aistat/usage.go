@@ -27,6 +27,8 @@ func runUsage(args []string, stdout, stderr io.Writer, g globals) int {
 	fs.Usage = func() {}
 	registerGlobalFlags(fs, &g)
 	fakeFn := registerFakeMode(fs)
+	var refresh bool
+	fs.BoolVar(&refresh, "refresh", false, "")
 
 	// First pass: parse any leading flags before the optional provider positional.
 	if err := fs.Parse(args); err != nil {
@@ -74,7 +76,7 @@ func runUsage(args []string, stdout, stderr io.Writer, g globals) int {
 	requested := selectedProviders(service)
 
 	serialStderr := httpx.NewConcurrencySafeWriter(stderr)
-	chosen, orchDebug := buildProviders(serialStderr, g.Debug, fakeFn)
+	chosen, orchDebug := buildProviders(serialStderr, g.Debug, refresh, fakeFn)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
