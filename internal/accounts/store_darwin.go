@@ -7,12 +7,29 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 )
+
+// safeWriter wraps an io.Writer with a mutex. Mirrors httpx.ConcurrencySafeWriter.
+// Needed because the orphan-warn path in List may be called from goroutines
+// exercising the store concurrently (e.g. parallel test cases), allowing
+// callers to pass a plain *bytes.Buffer to WithDebug without a data race.
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *safeWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
 
 const (
 	darwinServicePrefix = "aistat:accounts:claude:"

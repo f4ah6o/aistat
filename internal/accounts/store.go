@@ -3,7 +3,6 @@ package accounts
 import (
 	"context"
 	"io"
-	"sync"
 )
 
 // Store persists Claude accounts across invocations. All methods are safe for
@@ -27,25 +26,8 @@ type config struct {
 type Option func(*config)
 
 // WithDebug wires a writer that receives debug/diagnostic lines (e.g. orphan
-// index warnings on darwin). The writer is wrapped in a mutex-guarded adapter
-// internally — callers may pass an unguarded *bytes.Buffer without worrying
-// about goroutine races from concurrent List/Upsert/Delete calls. The wrap is
-// unconditional; the per-call overhead is negligible for the orphan-warn path.
+// index warnings on darwin). Platform implementations that emit on this writer
+// from concurrent goroutines wrap it internally for thread safety.
 func WithDebug(w io.Writer) Option {
 	return func(c *config) { c.debug = w }
-}
-
-// safeWriter wraps an io.Writer with a mutex. Mirrors httpx.ConcurrencySafeWriter.
-// Needed because the orphan-warn path in darwin's List may be called from
-// goroutines exercising the store concurrently (e.g. parallel test cases),
-// allowing callers to pass a plain *bytes.Buffer without a data race.
-type safeWriter struct {
-	mu sync.Mutex
-	w  io.Writer
-}
-
-func (s *safeWriter) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.w.Write(p)
 }
