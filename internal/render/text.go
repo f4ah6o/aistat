@@ -21,9 +21,6 @@ var textLabels = map[string][]struct{ Key, Label string }{
 // Text writes the human-readable rendering of report r for the providers in
 // requested (in the given order).
 func Text(w io.Writer, r providers.Report, requested []string) error {
-	if len(requested) == 0 {
-		return nil
-	}
 	var sections []string
 	for _, id := range requested {
 		result, ok := r.Providers[id]
