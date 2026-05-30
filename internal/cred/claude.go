@@ -16,8 +16,8 @@ var ErrClaudeTokenNotFound = errors.New(ClaudeTokenMissingMessage)
 // macOS or Linux).
 var ErrClaudeWriteUnsupported = errors.New("writing Claude live credential is not supported on this platform")
 
-// Credential holds the parsed fields of the Claude live keychain blob plus the
-// exact input bytes. Raw preserves the original payload byte-for-byte so
+// Credential holds the parsed fields of a provider's live credential blob plus
+// the exact input bytes. Raw preserves the original payload byte-for-byte so
 // callers can pass it onward (e.g. to WriteClaudeLiveBlob or accounts.Account)
 // without re-marshaling and without risking field loss.
 //
