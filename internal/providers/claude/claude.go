@@ -8,13 +8,14 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"time"
 
 	"github.com/drogers0/aistat/v2/internal/accounts"
 	"github.com/drogers0/aistat/v2/internal/cred"
 	"github.com/drogers0/aistat/v2/internal/httpx"
 	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers/multiaccount"
+	"github.com/drogers0/aistat/v2/internal/providers/usagecache"
 )
 
 const (
@@ -52,7 +53,7 @@ type Client struct {
 	now              func() time.Time
 	baseTimeout      time.Duration
 	perAccountBudget time.Duration
-	cache            *usageCache // always non-nil; disabled state degrades to no-op
+	cache            *usagecache.Cache // always non-nil; disabled state degrades to no-op
 	cacheBypass      bool        // skips the cache read path; writes still propagate (D8)
 }
 
@@ -105,7 +106,7 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 		o(c)
 	}
 	// Initialize cache after options so WithNow's clock propagates into the cache.
-	c.cache = newUsageCache(c.now, func(s string) { c.warnf("%s\n", s) })
+	c.cache = usagecache.New("claude", c.now, func(s string) { c.warnf("%s\n", s) })
 	return c
 }
 
@@ -212,8 +213,8 @@ func (c *Client) fetchLimitsCached(ctx context.Context, accessToken, uuid string
 		return c.fetchLimitsFresh(ctx, accessToken)
 	}
 	if !c.cacheBypass {
-		if cached, age, ok := c.cache.getWithAge(uuid); ok {
-			cached = recomputeResetAfter(cached, c.now())
+		if cached, age, ok := c.cache.GetWithAge(uuid); ok {
+			cached = multiaccount.RecomputeResetAfter(cached, c.now())
 			c.logCacheHit(uuid, age)
 			return cached, nil
 		}
@@ -223,23 +224,6 @@ func (c *Client) fetchLimitsCached(ctx context.Context, accessToken, uuid string
 		c.cache.Put(uuid, limits)
 	}
 	return limits, err
-}
-
-// recomputeResetAfter returns a new map with each Limit's ResetAfterSeconds
-// recomputed from its absolute ResetsAt against now. The input map is not
-// mutated — the cache stores absolute ResetsAt values; only the projection
-// into the current wall clock changes on each hit.
-func recomputeResetAfter(m map[string]providers.Limit, now time.Time) map[string]providers.Limit {
-	out := make(map[string]providers.Limit, len(m))
-	for k, l := range m {
-		secs := int(l.ResetsAt.Sub(now).Seconds())
-		if secs < 0 {
-			secs = 0
-		}
-		l.ResetAfterSeconds = secs
-		out[k] = l
-	}
-	return out
 }
 
 // logCacheHit emits one [debug] line on a usage cache hit.
@@ -272,34 +256,6 @@ func rotateRawBlob(rawBlob json.RawMessage, tok Token) (json.RawMessage, error) 
 		return nil, fmt.Errorf("rotateRawBlob: marshal: %w", err)
 	}
 	return json.RawMessage(out), nil
-}
-
-// sortAccountResults sorts results in-place: active first, then by Email ASCII
-// ascending. Deterministic ordering keeps JSON output diff-stable.
-func sortAccountResults(results []providers.AccountResult) {
-	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].Active != results[j].Active {
-			return results[i].Active
-		}
-		return results[i].Email < results[j].Email
-	})
-}
-
-// refreshErrorMessage maps a refresh error to a user-facing per-account error string.
-// recordFetchOutcome populates ar with the result of a usage fetch and reports
-// whether the call succeeded and (when it didn't) whether the failure was
-// transient. The counter updates stay at the call site so the D8 retry rule
-// (`ErrTransient` iff zero succeeded AND at least one transient) is visible in
-// Fetch's body rather than buried in a helper. Used by Fetch's fallback-row and
-// per-stored-account branches; the refresh-failure branch sets ar.Error itself
-// via refreshErrorMessage and shares the same counter discipline.
-func recordFetchOutcome(ar *providers.AccountResult, limits map[string]providers.Limit, fetchErr error) (success, transient bool) {
-	if fetchErr != nil {
-		ar.Error = fetchErr.Error()
-		return false, errors.Is(fetchErr, providers.ErrTransient)
-	}
-	ar.Limits = limits
-	return true, false
 }
 
 func refreshErrorMessage(err error) string {
@@ -417,7 +373,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	if reconcileOut.LiveUnstored != nil {
 		totalAccounts++
 	}
-	budget := c.baseTimeout + time.Duration(totalAccounts)*c.perAccountBudget
+	budget := multiaccount.Budget(c.baseTimeout, c.perAccountBudget, totalAccounts)
 	poolCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
@@ -434,7 +390,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 			Plan:   "",
 			Active: true,
 		}
-		if ok, trans := recordFetchOutcome(&ar, limits, fetchErr); ok {
+		if ok, trans := multiaccount.RecordFetchOutcome(&ar, limits, fetchErr); ok {
 			successCount++
 		} else if trans {
 			transientCount++
@@ -453,8 +409,8 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 
 		// Refresh if the token is near expiry (ExpiresAt present and within skew).
 		now := c.now()
-		if acct.ExpiresAt() > 0 && acct.ExpiresAt() < now.Add(refreshSkew).UnixMilli() {
-			tok, refreshErr := c.refresh.Exchange(poolCtx, acct.RefreshToken())
+		if StoredExpiresAt(acct) > 0 && StoredExpiresAt(acct) < now.Add(refreshSkew).UnixMilli() {
+			tok, refreshErr := c.refresh.Exchange(poolCtx, StoredRefreshToken(acct))
 			if refreshErr != nil {
 				ar.Error = refreshErrorMessage(refreshErr)
 				if errors.Is(refreshErr, providers.ErrTransient) {
@@ -471,8 +427,8 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 			}
 		}
 
-		limits, fetchErr := c.fetchLimitsCached(poolCtx, acct.AccessToken(), acct.UUID)
-		if ok, trans := recordFetchOutcome(&ar, limits, fetchErr); ok {
+		limits, fetchErr := c.fetchLimitsCached(poolCtx, StoredAccessToken(acct), acct.UUID)
+		if ok, trans := multiaccount.RecordFetchOutcome(&ar, limits, fetchErr); ok {
 			successCount++
 		} else if trans {
 			transientCount++
@@ -484,7 +440,7 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 	// The provider-level Limits field is left nil — when Accounts is populated,
 	// ProviderResult.MarshalJSON omits the top-level "limits" key entirely, and
 	// the text renderer routes on len(Accounts) > 0 to its per-account view.
-	sortAccountResults(accountResults)
+	multiaccount.SortAccountResults(accountResults)
 
 	out := providers.ProviderOutput{
 		Accounts: accountResults,
@@ -549,13 +505,13 @@ func (c *Client) FetchForSwitch(ctx context.Context) ([]providers.AccountResult,
 		}
 	}
 
-	budget := c.baseTimeout + time.Duration(len(nonActive))*c.perAccountBudget
+	budget := multiaccount.Budget(c.baseTimeout, c.perAccountBudget, len(nonActive))
 	poolCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
 	var results []providers.AccountResult
 	for _, acct := range nonActive {
-		limits, fetchErr := c.fetchLimitsCached(poolCtx, acct.AccessToken(), acct.UUID)
+		limits, fetchErr := c.fetchLimitsCached(poolCtx, StoredAccessToken(acct), acct.UUID)
 		if fetchErr != nil {
 			if errors.Is(fetchErr, providers.ErrAuthDenied) {
 				c.warnf("aistat: claude: %s: stored credential rejected (run `aistat usage` to refresh); excluded from auto-pick\n", acct.Email)

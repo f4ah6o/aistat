@@ -30,7 +30,7 @@ var uuidishRe = regexp.MustCompile(`(?i)^[0-9a-f\-]{8,}$`)
 // openAccountStore is the function used by runAccountsSubcommand to open the
 // platform account store. Replaced in tests to inject open failures.
 var openAccountStore = func(debug io.Writer) (accounts.Store, error) {
-	return accounts.OpenStore(accounts.WithDebug(debug))
+	return accounts.OpenStore(accounts.ProviderClaude, accounts.WithDebug(debug))
 }
 
 // runAccountsSubcommand is the entry point called from main's dispatch table.

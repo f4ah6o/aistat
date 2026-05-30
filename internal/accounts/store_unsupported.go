@@ -14,7 +14,10 @@ var ErrUnsupportedPlatform = errors.New("accounts: platform not supported")
 type unsupportedStore struct{}
 
 // OpenStore returns the unsupported-platform store stub.
-func OpenStore(opts ...Option) (Store, error) {
+func OpenStore(provider Provider, opts ...Option) (Store, error) {
+	if err := provider.validate(); err != nil {
+		return nil, err
+	}
 	return unsupportedStore{}, nil
 }
 

@@ -32,20 +32,34 @@ func (s *safeWriter) Write(p []byte) (int, error) {
 }
 
 const (
-	darwinServicePrefix = "aistat:accounts:claude:"
-	darwinIndexService  = "aistat:accounts:claude:index"
-	darwinIndexAccount  = "index"
+	darwinIndexAccount = "index"
 )
 
+// darwinPerAccountService returns the per-account keychain service name for
+// the given provider and UUID.
+func darwinPerAccountService(p Provider, uuid string) string {
+	return "aistat:accounts:" + string(p) + ":" + uuid
+}
+
+// darwinAccountIndexService returns the keychain service name for the index
+// item for the given provider.
+func darwinAccountIndexService(p Provider) string {
+	return "aistat:accounts:" + string(p) + ":index"
+}
+
 type darwinStore struct {
+	provider Provider
 	lockPath string
 	debug    *safeWriter // nil when debug is disabled
 }
 
-// OpenStore returns the macOS Keychain-backed account store. The lock file
-// sentinel is created (lazily, mode 0600) at os.UserCacheDir()/aistat/store.lock;
+// OpenStore returns the macOS Keychain-backed account store for the given provider.
+// The lock file sentinel is created (lazily, mode 0600) at os.UserCacheDir()/aistat/store.lock;
 // its parent directory is created with mode 0700 if absent.
-func OpenStore(opts ...Option) (Store, error) {
+func OpenStore(provider Provider, opts ...Option) (Store, error) {
+	if err := provider.validate(); err != nil {
+		return nil, err
+	}
 	cfg := &config{}
 	for _, o := range opts {
 		o(cfg)
@@ -58,7 +72,10 @@ func OpenStore(opts ...Option) (Store, error) {
 	if err := os.MkdirAll(lockDir, 0700); err != nil {
 		return nil, fmt.Errorf("accounts: cannot create lock dir %s: %w", lockDir, err)
 	}
-	s := &darwinStore{lockPath: filepath.Join(lockDir, "store.lock")}
+	s := &darwinStore{
+		provider: provider,
+		lockPath: filepath.Join(lockDir, "store.lock"),
+	}
 	if cfg.debug != nil {
 		s.debug = &safeWriter{w: cfg.debug}
 	}
@@ -88,7 +105,7 @@ func (s *darwinStore) withLock(fn func() error) error {
 // Returns a nil slice (not an error) if the index item does not exist.
 func (s *darwinStore) readIndex(ctx context.Context) ([]string, error) {
 	cmd := exec.CommandContext(ctx, "security", "find-generic-password",
-		"-s", darwinIndexService, "-a", darwinIndexAccount, "-w")
+		"-s", darwinAccountIndexService(s.provider), "-a", darwinIndexAccount, "-w")
 	out, err := cmd.Output()
 	if err != nil {
 		if darwinIsNotFound(err) {
@@ -113,7 +130,7 @@ func (s *darwinStore) readIndex(ctx context.Context) ([]string, error) {
 // An empty slice deletes the index item entirely (clean state after final remove).
 func (s *darwinStore) writeIndex(ctx context.Context, uuids []string) error {
 	if len(uuids) == 0 {
-		return darwinDeleteItem(ctx, darwinIndexService, darwinIndexAccount)
+		return darwinDeleteItem(ctx, darwinAccountIndexService(s.provider), darwinIndexAccount)
 	}
 	data, err := json.Marshal(struct {
 		UUIDs []string `json:"uuids"`
@@ -121,14 +138,14 @@ func (s *darwinStore) writeIndex(ctx context.Context, uuids []string) error {
 	if err != nil {
 		return err
 	}
-	return darwinWriteItem(ctx, darwinIndexService, darwinIndexAccount, string(data))
+	return darwinWriteItem(ctx, darwinAccountIndexService(s.provider), darwinIndexAccount, string(data))
 }
 
 // darwinReadAccountItem reads the Account JSON for the given UUID.
 // Returns nil, nil if not found. Looks up by service only (no account filter)
 // so that identity-drift email changes (D9) do not break the read path.
-func darwinReadAccountItem(ctx context.Context, uuid string) ([]byte, error) {
-	svc := darwinServicePrefix + uuid
+func darwinReadAccountItem(ctx context.Context, p Provider, uuid string) ([]byte, error) {
+	svc := darwinPerAccountService(p, uuid)
 	cmd := exec.CommandContext(ctx, "security", "find-generic-password",
 		"-s", svc, "-w")
 	out, err := cmd.Output()
@@ -156,8 +173,8 @@ func darwinReadAccountItem(ctx context.Context, uuid string) ([]byte, error) {
 // per-account item is gone while the UUID may still be in the index. List
 // will surface this as an orphan-in-index warn (aistat: orphan account
 // index entry <uuid>). The next Upsert call recreates the item cleanly.
-func upsertAccountItem(ctx context.Context, a Account) error {
-	svc := darwinServicePrefix + a.UUID
+func upsertAccountItem(ctx context.Context, p Provider, a Account) error {
+	svc := darwinPerAccountService(p, a.UUID)
 	// darwinDeleteItem returns nil for "not found", so this is always safe on
 	// first-time upsert. Propagate any other error (e.g. permission denied).
 	if err := darwinDeleteItem(ctx, svc, ""); err != nil {
@@ -210,7 +227,7 @@ func (s *darwinStore) List(ctx context.Context) ([]Account, error) {
 			return err
 		}
 		for _, uuid := range uuids {
-			data, err := darwinReadAccountItem(ctx, uuid)
+			data, err := darwinReadAccountItem(ctx, s.provider, uuid)
 			if err != nil {
 				return err
 			}
@@ -243,7 +260,7 @@ func (s *darwinStore) Upsert(ctx context.Context, a Account) error {
 		// --debug warn. The opposite ordering would produce an in-index item
 		// whose fetch returns nil (an orphan-in-index), which is harder to
 		// detect and surface.
-		if err := upsertAccountItem(ctx, a); err != nil {
+		if err := upsertAccountItem(ctx, s.provider, a); err != nil {
 			return err
 		}
 		uuids, err := s.readIndex(ctx)
@@ -281,7 +298,7 @@ func (s *darwinStore) Delete(ctx context.Context, uuid string) error {
 		if err := s.writeIndex(ctx, filtered); err != nil {
 			return err
 		}
-		svc := darwinServicePrefix + uuid
+		svc := darwinPerAccountService(s.provider, uuid)
 		return darwinDeleteItem(ctx, svc, "")
 	})
 }

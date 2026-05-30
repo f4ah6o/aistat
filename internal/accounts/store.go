@@ -5,7 +5,7 @@ import (
 	"io"
 )
 
-// Store persists Claude accounts across invocations. All methods are safe for
+// Store persists provider accounts across invocations. All methods are safe for
 // concurrent use. The concrete implementation is platform-specific; obtain one
 // via OpenStore.
 type Store interface {

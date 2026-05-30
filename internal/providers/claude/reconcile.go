@@ -170,7 +170,7 @@ func findActive(in ReconcileInput) (matchIdx int, prof Profile, profileErr error
 	// D1 step 1: byte-match. First match wins (pinned behaviour for the
 	// pathological case where two stored slots share an access token).
 	for i, acct := range in.Stored {
-		if acct.AccessToken() == in.LiveBlob.AccessToken {
+		if StoredAccessToken(acct) == in.LiveBlob.AccessToken {
 			return i, Profile{}, nil
 		}
 	}

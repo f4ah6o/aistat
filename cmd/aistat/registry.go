@@ -34,7 +34,7 @@ func realProviders(serialStderr *httpx.ConcurrencySafeWriter, includeDebug bool,
 	if includeDebug {
 		storeDebug = serialStderr
 	}
-	store, err := accounts.OpenStore(accounts.WithDebug(storeDebug))
+	store, err := accounts.OpenStore(accounts.ProviderClaude, accounts.WithDebug(storeDebug))
 	if err != nil {
 		fmt.Fprintln(serialStderr, "aistat: claude: could not open account store ("+err.Error()+"); proceeding with live credential only")
 		store = accounts.NewMemoryStore()

@@ -237,7 +237,7 @@ func runSwitch(args []string, stdout, stderr io.Writer, g globals) int {
 		// Compare best candidate with active account to check "already on best" (D13).
 		// fetchLiveUsage is read-only: no store mutation regardless of result.
 		if activeAcct := findAccountByUUID(stored, activeUUID); activeAcct != nil {
-			activeLimits, liveErr := fetchLiveUsage(ctx, activeAcct.AccessToken(), activeAcct.UUID, claude.DefaultUserAgent(resolvedVersion()), debugW)
+			activeLimits, liveErr := fetchLiveUsage(ctx, claude.StoredAccessToken(*activeAcct), activeAcct.UUID, claude.DefaultUserAgent(resolvedVersion()), debugW)
 			if liveErr == nil {
 				activeAR := providers.AccountResult{Limits: activeLimits}
 				var bestLastSeen time.Time
