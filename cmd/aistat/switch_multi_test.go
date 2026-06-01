@@ -142,15 +142,9 @@ func TestSwitchBulk(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "[claude]") {
-				t.Errorf("missing [claude] header; stdout: %q", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "[codex]") {
-				t.Errorf("missing [codex] header; stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "[claude]")
+			wantOut(t, r, "[codex]")
 			if *claudeWritten == nil {
 				t.Error("Claude blob not written")
 			}
@@ -183,12 +177,8 @@ func TestSwitchBulk(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "[claude]") {
-				t.Errorf("missing [claude] header; stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "[claude]")
 			if strings.Contains(r.stdout, "[codex]") {
 				t.Errorf("[codex] header should not appear; stdout: %q", r.stdout)
 			}
@@ -221,15 +211,11 @@ func TestSwitchBulk(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if strings.Contains(r.stdout, "[claude]") {
 				t.Errorf("[claude] header should not appear; stdout: %q", r.stdout)
 			}
-			if !strings.Contains(r.stdout, "[codex]") {
-				t.Errorf("missing [codex] header; stdout: %q", r.stdout)
-			}
+			wantOut(t, r, "[codex]")
 			if *claudeWritten != nil {
 				t.Error("Claude blob should NOT have been written")
 			}
@@ -246,12 +232,8 @@ func TestSwitchBulk(t *testing.T) {
 			withCodexMemoryStore(t) // empty Codex
 
 			r := runSwitchMultiTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-				t.Errorf("missing expected message; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
 		}},
 		{"skips empty store", func(t *testing.T) {
 			now := time.Now()
@@ -274,12 +256,8 @@ func TestSwitchBulk(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "[codex]") {
-				t.Errorf("missing [codex] header; stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "[codex]")
 			if *claudeWritten != nil {
 				t.Error("Claude blob should NOT have been written (empty store, skipped)")
 			}
@@ -317,19 +295,11 @@ func TestSwitchBulk(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest()
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
+			wantExit(t, r, 2)
 			// D5: per-provider headers must appear in stdout even when a provider fails.
-			if !strings.Contains(r.stdout, "[claude]") {
-				t.Errorf("missing [claude] header in stdout (D5); stdout: %q", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "[codex]") {
-				t.Errorf("missing [codex] header in stdout (D5); stdout: %q", r.stdout)
-			}
-			if !strings.Contains(r.stderr, "write to live credential failed") {
-				t.Errorf("missing Claude write error; stderr: %q", r.stderr)
-			}
+			wantOut(t, r, "[claude]")
+			wantOut(t, r, "[codex]")
+			wantErrOut(t, r, "write to live credential failed")
 			if *codexWritten == nil {
 				t.Error("Codex blob should have been written despite Claude failure")
 			}
@@ -370,9 +340,7 @@ func TestSwitchProviderArg(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest("claude")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if *claudeWritten == nil {
 				t.Error("Claude blob should have been written")
 			}
@@ -400,9 +368,7 @@ func TestSwitchProviderArg(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest("codex")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if *claudeWritten != nil {
 				t.Error("Claude should NOT have been touched")
 			}
@@ -415,12 +381,8 @@ func TestSwitchProviderArg(t *testing.T) {
 			withCodexMemoryStore(t)
 
 			r := runSwitchMultiTest("bogus")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "unknown provider") {
-				t.Errorf("missing unknown provider error; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "unknown provider")
 		}},
 		{"claude one account login hint", func(t *testing.T) {
 			ms := withMemoryStore(t)
@@ -429,25 +391,16 @@ func TestSwitchProviderArg(t *testing.T) {
 			withCodexMemoryStore(t)
 
 			r := runSwitchMultiTest("claude")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			want := "only one account stored; nothing to switch to (run `claude /login` to add another)"
-			if !strings.Contains(r.stderr, want) {
-				t.Errorf("missing Claude login hint; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "only one account stored; nothing to switch to (run `claude /login` to add another)")
 		}},
 		{"codex zero accounts errors", func(t *testing.T) {
 			withMemoryStore(t)
 			withCodexMemoryStore(t) // empty Codex store
 
 			r := runSwitchMultiTest("codex")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "no accounts stored") {
-				t.Errorf("missing 'no accounts stored' message; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "no accounts stored")
 		}},
 	}
 	for _, tt := range tests {
@@ -474,9 +427,7 @@ func TestSwitchToInfer(t *testing.T) {
 			withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest("--to", "unique")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if *claudeWritten == nil {
 				t.Error("Claude blob should have been written")
 			}
@@ -493,9 +444,7 @@ func TestSwitchToInfer(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest("--to", "user@codex")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if *claudeWritten != nil {
 				t.Error("Claude should NOT have been touched")
 			}
@@ -511,12 +460,8 @@ func TestSwitchToInfer(t *testing.T) {
 			seedCodexAccount(t, codexMS, "uuid-ds", "shared@chatgpt.com", "plan", time.Now())
 
 			r := runSwitchMultiTest("--to", "shared")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "multiple providers match") {
-				t.Errorf("missing ambiguity error; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "multiple providers match")
 		}},
 		{"same provider multi match shows single-provider message", func(t *testing.T) {
 			claudeMS := withMemoryStore(t)
@@ -526,12 +471,8 @@ func TestSwitchToInfer(t *testing.T) {
 			withCodexMemoryStore(t) // empty → no Codex match
 
 			r := runSwitchMultiTest("--to", "shared")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "multiple stored accounts match") {
-				t.Errorf("missing single-provider disambiguation message; stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "multiple stored accounts match")
 			if strings.Contains(r.stderr, "multiple providers match") {
 				t.Errorf("should NOT show cross-provider ambiguity message; stderr: %q", r.stderr)
 			}
@@ -548,9 +489,7 @@ func TestSwitchToInfer(t *testing.T) {
 			codexWritten, _ := withCodexWriteBlob(t)
 
 			r := runSwitchMultiTest("codex", "--to", "target@codex.com")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if *claudeWritten != nil {
 				t.Error("Claude should NOT have been touched")
 			}

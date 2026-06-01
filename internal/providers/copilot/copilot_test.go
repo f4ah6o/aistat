@@ -19,6 +19,13 @@ import (
 
 const testLogin = "testuser" // matches testdata/user.json's "login" field
 
+func wantNoErr(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // routes a httptest server: /user → userFixture; anything matching billing prefix → usageFixture.
 func newRoutedClient(t *testing.T, userFixture, usageFixture []byte, userStatus, usageStatus int, opts ...Option) (*Client, *recordedReqs) {
 	t.Helper()
@@ -65,9 +72,7 @@ func TestFetch_goldenFlow(t *testing.T) {
 		{"pro fixture used percent and reset", func(t *testing.T) {
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			m, ok := out.Limits["month"]
 			if !ok {
 				t.Fatal("missing month limit")
@@ -90,17 +95,13 @@ func TestFetch_goldenFlow(t *testing.T) {
 			// Raw struct value is unrounded; JSON output is rounded to 2 dp.
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			raw := out.Limits["month"].UsedPercent
 			if raw < 53.133 || raw > 53.134 {
 				t.Errorf("raw struct UsedPercent should be unrounded (~53.1333), got %v", raw)
 			}
 			b, err := json.Marshal(out.Limits["month"])
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if !strings.Contains(string(b), `"used_percent":53.13`) {
 				t.Errorf("JSON should round to 53.13, got %s", string(b))
 			}
@@ -184,9 +185,7 @@ func TestFetch_quotaMath(t *testing.T) {
 			overage := []byte(`{"usageItems":[{"product":"Copilot","sku":"Copilot Premium Request","grossQuantity":400}]}`)
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), overage, 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 100 {
 				t.Errorf("used_percent should be clamped to 100, got %v", out.Limits["month"].UsedPercent)
 			}
@@ -197,9 +196,7 @@ func TestFetch_quotaMath(t *testing.T) {
 		{"empty usage items", func(t *testing.T) {
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), []byte(`{"usageItems":[]}`), 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 0 {
 				t.Errorf("expected 0%% used, got %v", out.Limits["month"].UsedPercent)
 			}
@@ -226,9 +223,7 @@ func TestFetch_skuWarn(t *testing.T) {
 				WithWarn(func(s string) { warnings = append(warnings, s) }),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 0 {
 				t.Errorf("expected 0%% used when no items match, got %v", out.Limits["month"].UsedPercent)
 			}
@@ -252,9 +247,7 @@ func TestFetch_skuWarn(t *testing.T) {
 				WithWarn(func(s string) { warnings = append(warnings, s) }),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 0 {
 				t.Errorf("expected 0%% used, got %v", out.Limits["month"].UsedPercent)
 			}
@@ -275,9 +268,7 @@ func TestFetch_skuWarn(t *testing.T) {
 				WithWarn(func(s string) { warnings = append(warnings, s) }),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 0 {
 				t.Errorf("expected 0%% used (no premium-request SKU observed), got %v", out.Limits["month"].UsedPercent)
 			}
@@ -296,9 +287,7 @@ func TestFetch_skuWarn(t *testing.T) {
 				WithWarn(func(s string) { warnings = append(warnings, s) }),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			if out.Limits["month"].UsedPercent != 0 {
 				t.Errorf("expected 0%% used, got %v", out.Limits["month"].UsedPercent)
 			}
@@ -313,9 +302,7 @@ func TestFetch_skuWarn(t *testing.T) {
 	]}`)
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), body, 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			want := 30.0 / 300 * 100 // 10%
 			if math.Abs(out.Limits["month"].UsedPercent-want) > 0.01 {
 				t.Errorf("non-Copilot items leaked into sum: got %v, want ~%v", out.Limits["month"].UsedPercent, want)
@@ -467,9 +454,7 @@ func TestFetch_RequestShape(t *testing.T) {
 	fixed := time.Date(2024, time.March, 15, 0, 0, 0, 0, time.UTC)
 	c, rec := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200, WithNow(func() time.Time { return fixed }))
 	_, err := c.Fetch(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	wantNoErr(t, err)
 	if len(rec.reqs) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(rec.reqs))
 	}
@@ -523,9 +508,7 @@ func TestFetch_reset(t *testing.T) {
 				WithNow(func() time.Time { return frozen }),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			nowTrunc := frozen.Truncate(time.Second)
 			reset := time.Date(nowTrunc.Year(), nowTrunc.Month()+1, 1, 0, 0, 0, 0, time.UTC)
 			want := int(reset.Sub(nowTrunc).Seconds())
@@ -536,9 +519,7 @@ func TestFetch_reset(t *testing.T) {
 		{"reset time is start of next month", func(t *testing.T) {
 			c, _ := newRoutedClient(t, testutil.LoadFixture(t, "user.json"), testutil.LoadFixture(t, "usage.json"), 200, 200)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			r := out.Limits["month"].ResetsAt
 			if r.Day() != 1 || r.Hour() != 0 || r.Minute() != 0 || r.Second() != 0 {
 				t.Errorf("resets_at should be midnight on day 1, got %v", r)
@@ -565,9 +546,7 @@ func TestFetch_reset(t *testing.T) {
 				}),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			wantReset := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
 			if got := out.Limits["month"].ResetsAt; !got.Equal(wantReset) {
 				t.Errorf("ResetsAt = %v, want %v (must reflect subNow's month, not urlNow's)", got, wantReset)
@@ -593,9 +572,7 @@ func TestFetch_reset(t *testing.T) {
 				}),
 			)
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
+			wantNoErr(t, err)
 			expectedReset := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 			expectedSecs := int(expectedReset.Sub(base.Add(5 * time.Second)).Seconds())
 			if got := out.Limits["month"].ResetAfterSeconds; got != expectedSecs {

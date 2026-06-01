@@ -29,30 +29,34 @@ import (
 // validate limit values.
 var minUsageBody = []byte(`{"five_hour":{"utilization":50.0,"resets_at":"2027-01-01T00:00:00+00:00"}}`)
 
-// stubStaticServer returns an httptest.Server that always responds with the
-// given status and body. The server is closed on t.Cleanup.
-func stubStaticServer(t *testing.T, status int, body []byte) *httptest.Server {
+// ── assertion helpers ────────────────────────────────────────────────────────
+
+func wantNoErr(t *testing.T, err error) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
-// stubCountingServer returns an httptest.Server that always responds with the
-// given status and body, and an atomic counter that increments on each request.
-func stubCountingServer(t *testing.T, status int, body []byte) (*httptest.Server, *atomic.Int32) {
+func wantErrIs(t *testing.T, err error, target error) {
 	t.Helper()
-	var count atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count.Add(1)
-		w.WriteHeader(status)
-		_, _ = w.Write(body)
-	}))
-	t.Cleanup(srv.Close)
-	return srv, &count
+	if !errors.Is(err, target) {
+		t.Fatalf("error = %v, want errors.Is %v", err, target)
+	}
+}
+
+func wantAccounts(t *testing.T, out providers.ProviderOutput, n int) {
+	t.Helper()
+	if len(out.Accounts) != n {
+		t.Fatalf("Accounts len = %d, want %d", len(out.Accounts), n)
+	}
+}
+
+func wantWarn(t *testing.T, buf fmt.Stringer, sub string) {
+	t.Helper()
+	if !strings.Contains(buf.String(), sub) {
+		t.Fatalf("warn = %q, want contains %q", buf.String(), sub)
+	}
 }
 
 // stubSequentialServer returns an httptest.Server that serves responses[0] for
@@ -164,28 +168,28 @@ func buildClient(
 	}
 }
 
-// noRefreshServer returns a stub refresh server that fails the test if hit.
-// The server is closed on t.Cleanup.
-func noRefreshServer(t *testing.T) *httptest.Server {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("refresh server must not be called, but received %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(500)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+// ── fetch fixture ────────────────────────────────────────────────────────────
+
+type fetchOpts struct {
+	usage, profile, refresh *httptest.Server
+	live                    *cred.Credential
+	store                   accounts.Store
+	warn                    io.Writer
+	now                     func() time.Time
 }
 
-// noProfileServer returns a stub profile server that fails the test if hit.
-// The server is closed on t.Cleanup.
-func noProfileServer(t *testing.T) *httptest.Server {
+func runFetch(t *testing.T, o fetchOpts) (providers.ProviderOutput, error) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("profile server must not be called, but received %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(500)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	if o.usage == nil {
+		o.usage = testutil.NewStubServer(t, minUsageBody, 200, nil)
+	}
+	if o.profile == nil {
+		o.profile = testutil.RejectServer(t, "profile")
+	}
+	if o.refresh == nil {
+		o.refresh = testutil.RejectServer(t, "refresh")
+	}
+	return buildClient(t, o.usage, o.profile, o.refresh, o.live, o.store, o.warn, o.now).Fetch(context.Background())
 }
 
 // storeUUIDSet returns the set of UUIDs currently in the store.
@@ -225,13 +229,11 @@ func TestFetch_golden(t *testing.T) {
 			body := []byte(`{"five_hour":{"utilization":50,"resets_at":"` + resetsAt.Format(time.RFC3339Nano) + `"}}`)
 
 			live := makeCred("tok-live", "ref-live", 0)
-			storedAcct := makeAccount("uuid-1", "user@example.com", "tok-live", "ref-live", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), storedAcct)
+			store := testutil.MemStore(t, makeAccount("uuid-1", "user@example.com", "tok-live", "ref-live", 0))
 
-			usageSrv := stubStaticServer(t, 200, body)
-			profileSrv := noProfileServer(t) // byte-match → no profile call
-			refreshSrv := noRefreshServer(t) // no refresh needed (ExpiresAt == 0)
+			usageSrv := testutil.NewStubServer(t, body, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile") // byte-match → no profile call
+			refreshSrv := testutil.RejectServer(t, "refresh") // no refresh needed (ExpiresAt == 0)
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil,
 				func() time.Time { return frozen })
@@ -248,13 +250,11 @@ func TestFetch_golden(t *testing.T) {
 		}},
 		{"full fixture", func(t *testing.T) {
 			live := makeCred("tok-live", "ref-live", 0)
-			storedAcct := makeAccount("uuid-1", "user@example.com", "tok-live", "ref-live", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), storedAcct)
+			store := testutil.MemStore(t, makeAccount("uuid-1", "user@example.com", "tok-live", "ref-live", 0))
 
-			usageSrv := stubStaticServer(t, 200, testutil.LoadFixture(t, "usage.json"))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, testutil.LoadFixture(t, "usage.json"), 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
 			out, err := c.Fetch(context.Background())
@@ -301,12 +301,11 @@ func TestFetch_golden(t *testing.T) {
 		{"request shape", func(t *testing.T) {
 			var gotReq http.Request
 			live := makeCred("sk-ant-oat01-fake", "ref", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("u1", "a@b.com", "sk-ant-oat01-fake", "ref", 0))
+			store := testutil.MemStore(t, makeAccount("u1", "a@b.com", "sk-ant-oat01-fake", "ref", 0))
 
 			usageSrv := testutil.NewStubServer(t, testutil.LoadFixture(t, "usage.json"), 200, &gotReq)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
 			if err != nil {
@@ -342,12 +341,11 @@ func TestFetch_parse(t *testing.T) {
 		{"null resets_at skipped", func(t *testing.T) {
 			body := []byte(`{"five_hour":{"utilization":10.0,"resets_at":"2026-05-26T22:00:00+00:00"},"seven_day_omelette":{"utilization":50.0,"resets_at":null}}`)
 			live := makeCred("tok-live", "ref", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
+			store := testutil.MemStore(t, makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
 
-			usageSrv := stubStaticServer(t, 200, body)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, body, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			out, _ := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
 			if _, ok := out.Accounts[0].Limits["seven_day_omelette"]; ok {
@@ -357,12 +355,11 @@ func TestFetch_parse(t *testing.T) {
 		{"bad resets_at", func(t *testing.T) {
 			body := []byte(`{"five_hour":{"utilization":10.0,"resets_at":"yesterday"}}`)
 			live := makeCred("tok-live", "ref", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
+			store := testutil.MemStore(t, makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
 
-			usageSrv := stubStaticServer(t, 200, body)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, body, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			out, _ := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
 			if len(out.Accounts) == 0 {
@@ -377,12 +374,11 @@ func TestFetch_parse(t *testing.T) {
 		}},
 		{"non-JSON 200", func(t *testing.T) {
 			live := makeCred("tok-live", "ref", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
+			store := testutil.MemStore(t, makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
 
-			usageSrv := stubStaticServer(t, 200, []byte("<html>oops</html>"))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte("<html>oops</html>"), 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			out, _ := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
 			if len(out.Accounts) == 0 {
@@ -397,12 +393,11 @@ func TestFetch_parse(t *testing.T) {
 			// classified transient/auth-denied) and the provider does NOT surface a
 			// provider-level ErrTransient for a single-account non-transient failure.
 			live := makeCred("tok-live", "ref", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
+			store := testutil.MemStore(t, makeAccount("u1", "a@b.com", "tok-live", "ref", 0))
 
-			usageSrv := stubStaticServer(t, 418, []byte("teapot"))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte("teapot"), 418, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
 			// 418 is not transient → no provider-level ErrTransient.
@@ -430,23 +425,21 @@ func TestFetch_auth(t *testing.T) {
 	}{
 		{"token missing", func(t *testing.T) {
 			// nil liveCred + empty store → ErrAuthMissing
-			usageSrv := stubStaticServer(t, 200, []byte(`{}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte(`{}`), 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrAuthMissing) {
-				t.Errorf("expected ErrAuthMissing, got: %v", err)
-			}
+			wantErrIs(t, err, providers.ErrAuthMissing)
 			if !strings.Contains(err.Error(), cred.ClaudeTokenMissingMessage) {
 				t.Errorf("expected token-missing message, got: %v", err)
 			}
 		}},
 		{"token generic error propagated", func(t *testing.T) {
 			sentinel := errors.New("some keychain failure")
-			usageSrv := stubStaticServer(t, 200, []byte(`{}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte(`{}`), 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil)
 			c.readCredential = func(context.Context) (cred.Credential, error) {
@@ -454,9 +447,7 @@ func TestFetch_auth(t *testing.T) {
 			}
 
 			_, err := c.Fetch(context.Background())
-			if !errors.Is(err, sentinel) {
-				t.Errorf("generic error should propagate, got: %v", err)
-			}
+			wantErrIs(t, err, sentinel)
 			if errors.Is(err, providers.ErrAuthMissing) {
 				t.Errorf("generic err should not be classified ErrAuthMissing")
 			}
@@ -476,25 +467,14 @@ func TestFetch_multi_account(t *testing.T) {
 	}{
 		{"two accounts both succeed", func(t *testing.T) {
 			// active byte-match + one non-active stored. out.Accounts has 2 rows with active first.
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
 			live := makeCred("tok-a", "ref-a", 0) // byte-matches acctA → acctA is active
-
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t) // byte-match → no profile call
-			refreshSrv := noRefreshServer(t) // no refresh (ExpiresAt == 0)
-
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0),
+			)
+			out, err := runFetch(t, fetchOpts{live: live, store: store})
+			wantNoErr(t, err)
+			wantAccounts(t, out, 2)
 			// Active first.
 			if !out.Accounts[0].Active {
 				t.Errorf("Accounts[0] should be active (was %q)", out.Accounts[0].Email)
@@ -517,23 +497,13 @@ func TestFetch_multi_account(t *testing.T) {
 		{"two accounts email ordering", func(t *testing.T) {
 			// active first, then ASCII ascending by email.
 			// Two non-active stored accounts; live absent so neither is active.
-			acctZ := makeAccount("uuid-z", "zeta@example.com", "tok-z", "ref-z", 0)
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctZ)
-			_ = store.Upsert(context.Background(), acctA)
-
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
-
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, nil, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			store := testutil.MemStore(t,
+				makeAccount("uuid-z", "zeta@example.com", "tok-z", "ref-z", 0),
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+			)
+			out, err := runFetch(t, fetchOpts{store: store})
+			wantNoErr(t, err)
+			wantAccounts(t, out, 2)
 			if out.Accounts[0].Email >= out.Accounts[1].Email {
 				t.Errorf("accounts not sorted by email: %q >= %q", out.Accounts[0].Email, out.Accounts[1].Email)
 			}
@@ -545,27 +515,25 @@ func TestFetch_multi_account(t *testing.T) {
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
 			farExpiry := testNow.Add(1 * time.Hour).UnixMilli()
 
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", farExpiry)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
 			live := makeCred("tok-a", "ref-a", farExpiry) // byte-matches acctA
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", farExpiry),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", nearExpiry),
+			)
 
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t) // byte-match path
 			// Refresh server returns invalid_grant for acctB's refresh attempt.
-			refreshSrv := stubStaticServer(t, 400, []byte(`{"error":"invalid_grant"}`))
+			refreshSrv := testutil.NewStubServer(t, []byte(`{"error":"invalid_grant"}`), 400, nil)
 
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil,
-				func() time.Time { return testNow }).Fetch(context.Background())
+			out, err := runFetch(t, fetchOpts{
+				refresh: refreshSrv,
+				live:    live,
+				store:   store,
+				now:     func() time.Time { return testNow },
+			})
 			if err != nil {
 				t.Fatalf("provider should succeed (acctA ok), got: %v", err)
 			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			wantAccounts(t, out, 2)
 			// Provider-level Limits is intentionally nil — multi-account contract.
 			if out.Limits != nil {
 				t.Errorf("provider-level Limits should be nil; got %v", out.Limits)
@@ -604,21 +572,15 @@ func TestFetch_multi_account(t *testing.T) {
 		}},
 		{"all transient", func(t *testing.T) {
 			// Both accounts' usage fetch returns 503 → ErrTransient.
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
-			usageSrv := stubStaticServer(t, 503, []byte(`{"error":"service unavailable"}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0),
+			)
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"service unavailable"}`), 503, nil)
 
 			// live absent → both accounts non-active
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, nil, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient, got: %v", err)
-			}
+			out, err := runFetch(t, fetchOpts{usage: usageSrv, store: store})
+			wantErrIs(t, err, providers.ErrTransient)
 			if len(out.Accounts) != 2 {
 				t.Fatalf("partial accounts should still be returned, got %d", len(out.Accounts))
 			}
@@ -631,12 +593,10 @@ func TestFetch_multi_account(t *testing.T) {
 		{"mixed transient and auth denied", func(t *testing.T) {
 			// One transient + one auth-denied, zero succeeded →
 			// provider still returns ErrTransient (D8 retry rule).
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0),
+			)
 			// The MemoryStore List returns accounts in map-iteration order (non-deterministic).
 			// The httpx retry layer retries transient errors up to maxAttempts=3 times, so
 			// the transient account (whichever is fetched first) consumes 3 sequential 503s
@@ -652,13 +612,9 @@ func TestFetch_multi_account(t *testing.T) {
 				{503, []byte(`{"error":"unavailable"}`)}, // 3 = httpx.maxAttempts
 				{401, []byte(`{"error":"unauthorized"}`)},
 			})
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
 
-			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, nil, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient (mixed transient+auth-denied, zero succeeded), got: %v", err)
-			}
+			_, err := runFetch(t, fetchOpts{usage: usageSrv, store: store})
+			wantErrIs(t, err, providers.ErrTransient)
 		}},
 	}
 	for _, tt := range tests {
@@ -675,21 +631,15 @@ func TestFetch_live(t *testing.T) {
 			// Profile call fails → fallback row with "(live Claude account)", CaptureWarn emitted.
 			live := makeCred("tok-live", "ref-live", 0)
 			// empty store → no byte-match → profile call needed
-			store := accounts.NewMemoryStore()
 
-			profileSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.NewStubServer(t, []byte(`{"error":"unavailable"}`), 503, nil)
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			var warnBuf bytes.Buffer
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, &warnBuf, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if len(out.Accounts) != 1 {
-				t.Fatalf("Accounts len = %d, want 1 fallback row", len(out.Accounts))
-			}
+			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, nil, &warnBuf, nil).Fetch(context.Background())
+			wantNoErr(t, err)
+			wantAccounts(t, out, 1)
 			ar := out.Accounts[0]
 			if ar.Email != "(live Claude account)" {
 				t.Errorf("Email = %q, want %q", ar.Email, "(live Claude account)")
@@ -707,74 +657,46 @@ func TestFetch_live(t *testing.T) {
 				t.Error("fallback row should have limits from usage fetch")
 			}
 
-			warn := warnBuf.String()
-			if !strings.Contains(warn, "could not capture live account profile") {
-				t.Errorf("CaptureWarn missing generic fallback message, got: %q", warn)
-			}
-			if !strings.Contains(warn, "claude /login") {
-				t.Errorf("CaptureWarn missing recovery hint, got: %q", warn)
-			}
+			wantWarn(t, &warnBuf, "could not capture live account profile")
+			wantWarn(t, &warnBuf, "claude /login")
 		}},
 		{"profile missing fields", func(t *testing.T) {
 			// Profile 200 with missing account.uuid → stricter diagnostic warn.
 			live := makeCred("tok-live", "ref-live", 0)
-			store := accounts.NewMemoryStore()
 
 			// 200 response missing uuid.
-			profileSrv := stubStaticServer(t, 200, []byte(`{"account":{"uuid":"","email":"user@example.com"}}`))
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.NewStubServer(t, []byte(`{"account":{"uuid":"","email":"user@example.com"}}`), 200, nil)
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			var warnBuf bytes.Buffer
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, &warnBuf, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if len(out.Accounts) != 1 {
-				t.Fatalf("Accounts len = %d, want 1 fallback row", len(out.Accounts))
-			}
+			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, nil, &warnBuf, nil).Fetch(context.Background())
+			wantNoErr(t, err)
+			wantAccounts(t, out, 1)
 			if out.Accounts[0].Email != "(live Claude account)" {
 				t.Errorf("Email = %q, want fallback email", out.Accounts[0].Email)
 			}
 
-			warn := warnBuf.String()
-			if !strings.Contains(warn, "missing required fields") {
-				t.Errorf("CaptureWarn should use stricter diagnostic, got: %q", warn)
-			}
-			if strings.Contains(warn, "claude /login") {
-				t.Errorf("stricter diagnostic must not contain 'claude /login', got: %q", warn)
+			wantWarn(t, &warnBuf, "missing required fields")
+			if strings.Contains(warnBuf.String(), "claude /login") {
+				t.Errorf("stricter diagnostic must not contain 'claude /login', got: %q", warnBuf.String())
 			}
 		}},
 		{"live absent zero stored", func(t *testing.T) {
 			// Live absent + no stored accounts → ErrAuthMissing.
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
-
-			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrAuthMissing) {
-				t.Errorf("expected ErrAuthMissing, got: %v", err)
-			}
+			_, err := runFetch(t, fetchOpts{})
+			wantErrIs(t, err, providers.ErrAuthMissing)
 		}},
 		{"live absent stored present", func(t *testing.T) {
 			// No live credential, stored accounts present
 			// → all rows non-active, no ErrAuthMissing.
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("uuid-a", "a@b.com", "tok-a", "ref-a", 0))
-			_ = store.Upsert(context.Background(), makeAccount("uuid-b", "b@c.com", "tok-b", "ref-b", 0))
-
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
-
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, nil, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "a@b.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "b@c.com", "tok-b", "ref-b", 0),
+			)
+			out, err := runFetch(t, fetchOpts{store: store})
+			wantNoErr(t, err)
+			wantAccounts(t, out, 2)
 			for _, ar := range out.Accounts {
 				if ar.Active {
 					t.Errorf("account %q should not be active (no live credential)", ar.Email)
@@ -797,22 +719,18 @@ func TestFetchForSwitch(t *testing.T) {
 		{"happy path", func(t *testing.T) {
 			// Stored access token valid, usage 200, AccountResult populated,
 			// store unmodified, refresh server receives zero requests.
-			activeAcct := makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0)
-			nonActiveAcct := makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), activeAcct)
-			_ = store.Upsert(context.Background(), nonActiveAcct)
-
 			live := makeCred("tok-active", "ref-active", 0) // byte-matches activeAcct
+			store := testutil.MemStore(t,
+				makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0),
+				makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", 0),
+			)
 
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t) // byte-match → no profile call
-			refreshSrv, refreshCount := stubCountingServer(t, 200, refreshSuccessBody("at2", "rt2"))
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile") // byte-match → no profile call
+			refreshSrv, refreshCount := testutil.CountingServer(t, 200, refreshSuccessBody("at2", "rt2"))
 
 			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).FetchForSwitch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if len(out) != 1 {
 				t.Fatalf("FetchForSwitch should return 1 non-active account, got %d", len(out))
 			}
@@ -839,35 +757,26 @@ func TestFetchForSwitch(t *testing.T) {
 		{"stored token rejected", func(t *testing.T) {
 			// Usage 401 → account excluded from returned slice, per-account warn
 			// emitted, refresh never called, store unchanged.
-			activeAcct := makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0)
-			badAcct := makeAccount("uuid-bad", "bad@example.com", "tok-bad", "ref-bad", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), activeAcct)
-			_ = store.Upsert(context.Background(), badAcct)
-
 			live := makeCred("tok-active", "ref-active", 0)
+			store := testutil.MemStore(t,
+				makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0),
+				makeAccount("uuid-bad", "bad@example.com", "tok-bad", "ref-bad", 0),
+			)
 
-			usageSrv := stubStaticServer(t, 401, []byte(`{"error":"unauthorized"}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv, refreshCount := stubCountingServer(t, 200, refreshSuccessBody("at2", "rt2"))
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"unauthorized"}`), 401, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv, refreshCount := testutil.CountingServer(t, 200, refreshSuccessBody("at2", "rt2"))
 
 			var warnBuf bytes.Buffer
 			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, &warnBuf, nil).FetchForSwitch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 
 			if len(out) != 0 {
 				t.Errorf("rejected account should be excluded, got %d results", len(out))
 			}
 
-			warn := warnBuf.String()
-			if !strings.Contains(warn, "stored credential rejected") {
-				t.Errorf("warn should mention rejected credential, got: %q", warn)
-			}
-			if !strings.Contains(warn, "excluded from auto-pick") {
-				t.Errorf("warn should mention excluded from auto-pick, got: %q", warn)
-			}
+			wantWarn(t, &warnBuf, "stored credential rejected")
+			wantWarn(t, &warnBuf, "excluded from auto-pick")
 
 			// Store unchanged.
 			uuids := storeUUIDSet(t, store)
@@ -883,50 +792,38 @@ func TestFetchForSwitch(t *testing.T) {
 			// Usage 503 → account excluded with "usage fetch failed" warn.
 			// No live credential: the stored account is non-active, gets a usage fetch,
 			// returns 503 → excluded from the result set with a warn.
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
-			usageSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"unavailable"}`), 503, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			var warnBuf bytes.Buffer
 			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, &warnBuf, nil).FetchForSwitch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if len(out) != 0 {
 				t.Errorf("transient account should be excluded, got %d results", len(out))
 			}
-			warn := warnBuf.String()
-			if !strings.Contains(warn, "usage fetch failed") {
-				t.Errorf("warn should mention usage fetch failed, got: %q", warn)
-			}
-			if !strings.Contains(warn, "excluded from auto-pick") {
-				t.Errorf("warn should mention excluded from auto-pick, got: %q", warn)
-			}
+			wantWarn(t, &warnBuf, "usage fetch failed")
+			wantWarn(t, &warnBuf, "excluded from auto-pick")
 		}},
 		{"never refreshes never mutates store", func(t *testing.T) {
 			// FetchForSwitch does not touch the refresh server and does not mutate
 			// the store even when the account has a near-expiry token.
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
-			activeAcct := makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0)
-			otherAcct := makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), activeAcct)
-			_ = store.Upsert(context.Background(), otherAcct)
-
 			live := makeCred("tok-active", "ref-active", 0) // byte-matches active
+			store := testutil.MemStore(t,
+				makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0),
+				makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", nearExpiry),
+			)
 
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv, refreshCount := stubCountingServer(t, 200, refreshSuccessBody("tok-other2", "ref-other2"))
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv, refreshCount := testutil.CountingServer(t, 200, refreshSuccessBody("tok-other2", "ref-other2"))
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
 				nil, func() time.Time { return testNow }).FetchForSwitch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 
 			// Refresh must not have been called.
 			if n := refreshCount.Load(); n != 0 {
@@ -948,17 +845,15 @@ func TestFetchForSwitch(t *testing.T) {
 			// the cache, not the live endpoint. This pins the unified-code-path
 			// contract (D7, revised): switch and reporting share fetchLimitsCached so
 			// a recent aistat usage call's entries are reused here.
-			activeAcct := makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0)
-			otherAcct := makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), activeAcct)
-			_ = store.Upsert(context.Background(), otherAcct)
-
 			live := makeCred("tok-active", "ref-active", 0)
+			store := testutil.MemStore(t,
+				makeAccount("uuid-active", "active@example.com", "tok-active", "ref-active", 0),
+				makeAccount("uuid-other", "other@example.com", "tok-other", "ref-other", 0),
+			)
 
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
 
@@ -968,9 +863,7 @@ func TestFetchForSwitch(t *testing.T) {
 			})
 
 			results, err := c.FetchForSwitch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if len(results) != 1 {
 				t.Fatalf("FetchForSwitch returned %d results, want 1", len(results))
 			}
@@ -998,21 +891,16 @@ func TestFetch_persist(t *testing.T) {
 			// An account with a near-expiry token is refreshed, and the store ends
 			// up with the rotated AT2/RT2 blob.
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-
 			live := makeCred("tok-a", "ref-a", nearExpiry) // byte-matches
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry))
 
-			refreshSrv := stubStaticServer(t, 200, refreshSuccessBody("tok-a2", "ref-a2"))
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
+			refreshSrv := testutil.NewStubServer(t, refreshSuccessBody("tok-a2", "ref-a2"), 200, nil)
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
 				nil, func() time.Time { return testNow }).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 
 			// Verify the store now has AT2/RT2 in the blob.
 			stored, _ := store.List(context.Background())
@@ -1031,26 +919,21 @@ func TestFetch_persist(t *testing.T) {
 			// expiresAt=0 to the blob — not preserve the stale pre-rotation
 			// timestamp — so the skew guard does not re-trigger on the next run.
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-
 			live := makeCred("tok-a", "ref-a", nearExpiry)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry))
 
 			// Refresh response deliberately omits expires_in.
 			noExpiryBody, _ := json.Marshal(map[string]any{
 				"access_token":  "tok-a2",
 				"refresh_token": "ref-a2",
 			})
-			refreshSrv := stubStaticServer(t, 200, noExpiryBody)
-			usageSrv := stubStaticServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
+			refreshSrv := testutil.NewStubServer(t, noExpiryBody, 200, nil)
+			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
+			profileSrv := testutil.RejectServer(t, "profile")
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
 				nil, func() time.Time { return testNow }).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 
 			stored, _ := store.List(context.Background())
 			if len(stored) != 1 {
@@ -1073,7 +956,7 @@ func TestFetch_persist(t *testing.T) {
 			store := accounts.NewMemoryStore()
 
 			profBody := profileBody("uuid-new", "new@example.com", "default_claude_max_5x")
-			profileSrv := stubStaticServer(t, 200, profBody)
+			profileSrv := testutil.NewStubServer(t, profBody, 200, nil)
 
 			var upsertedBeforeUsage bool
 			usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1089,13 +972,10 @@ func TestFetch_persist(t *testing.T) {
 			}))
 			t.Cleanup(usageSrv.Close)
 
-			refreshSrv := noRefreshServer(t)
-			t.Cleanup(refreshSrv.Close)
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if !upsertedBeforeUsage {
 				t.Error("account should be upserted (step 5) before the first usage fetch")
 			}
@@ -1103,18 +983,13 @@ func TestFetch_persist(t *testing.T) {
 		{"provider limits from active account", func(t *testing.T) {
 			// Provider-level Limits is the active account's limits (or nil when
 			// active account errored).
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-
 			live := makeCred("tok-a", "ref-a", 0) // active
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
 			// Usage returns an error → active account has no limits → provider Limits = nil.
-			usageSrv := stubStaticServer(t, 503, []byte(`{"error":"down"}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"down"}`), 503, nil)
 
-			out, _ := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
+			out, _ := runFetch(t, fetchOpts{usage: usageSrv, live: live, store: store})
 			if out.Limits != nil {
 				t.Errorf("Limits should be nil when active account errored, got %v", out.Limits)
 			}
@@ -1122,11 +997,11 @@ func TestFetch_persist(t *testing.T) {
 		{"three accounts mixed for ErrTransient rule", func(t *testing.T) {
 			// 3 accounts, 2 transient + 1 auth-denied, zero succeeded → ErrTransient.
 			// Pins the D8 retry trigger.
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
-			_ = store.Upsert(context.Background(), makeAccount("uuid-b", "b@example.com", "tok-b", "ref-b", 0))
-			_ = store.Upsert(context.Background(), makeAccount("uuid-c", "c@example.com", "tok-c", "ref-c", 0))
-
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "b@example.com", "tok-b", "ref-b", 0),
+				makeAccount("uuid-c", "c@example.com", "tok-c", "ref-c", 0),
+			)
 			// 2 transient accounts × maxAttempts=3 each = 6 consecutive 503s; the 3rd
 			// account (whichever it is in non-deterministic map order) receives the repeated
 			// 401 last entry. Update the response count if httpx.maxAttempts changes.
@@ -1142,34 +1017,29 @@ func TestFetch_persist(t *testing.T) {
 				{503, []byte(`{"error":"down"}`)}, // 6 = 2 accounts × httpx.maxAttempts(3)
 				{401, []byte(`{"error":"unauthorized"}`)},
 			})
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
 
-			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, store, nil, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient (2 transient + 1 auth-denied, zero succeeded), got: %v", err)
-			}
+			_, err := runFetch(t, fetchOpts{usage: usageSrv, store: store})
+			wantErrIs(t, err, providers.ErrTransient)
 		}},
 		{"refresh transient ErrTransient", func(t *testing.T) {
 			// Single account with near-expiry token, refresh server returns 503 →
 			// refresh fails transient → successCount==0, transientCount>0 →
 			// provider returns ErrTransient.
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-
 			live := makeCred("tok-a", "ref-a", nearExpiry) // byte-matches
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry))
 
-			refreshSrv := stubStaticServer(t, 503, []byte(`{"error":"service unavailable"}`))
-			usageSrv := noRefreshServer(t) // usage must not be reached after refresh fails
-			profileSrv := noProfileServer(t)
+			refreshSrv := testutil.NewStubServer(t, []byte(`{"error":"service unavailable"}`), 503, nil)
+			usageSrv := testutil.RejectServer(t, "usage") // usage must not be reached after refresh fails
 
-			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
-				nil, func() time.Time { return testNow }).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient when refresh fails transient, got: %v", err)
-			}
+			_, err := runFetch(t, fetchOpts{
+				usage:   usageSrv,
+				refresh: refreshSrv,
+				live:    live,
+				store:   store,
+				now:     func() time.Time { return testNow },
+			})
+			wantErrIs(t, err, providers.ErrTransient)
 		}},
 		{"live unstored usage fetch fails", func(t *testing.T) {
 			// Live credential present, empty store, profile call returns 503 →
@@ -1177,41 +1047,34 @@ func TestFetch_persist(t *testing.T) {
 			// transientCount > 0, successCount == 0 → provider returns ErrTransient.
 			live := makeCred("tok-live", "ref-live", 0)
 
-			profileSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
-			usageSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.NewStubServer(t, []byte(`{"error":"unavailable"}`), 503, nil)
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"unavailable"}`), 503, nil)
 
 			var warnBuf bytes.Buffer
-			_, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, nil, &warnBuf, nil).Fetch(context.Background())
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient (live unstored, usage transient), got: %v", err)
-			}
-			if !strings.Contains(warnBuf.String(), "live row without storing") {
-				t.Errorf("warn should mention live row without storing, got: %q", warnBuf.String())
-			}
+			_, err := runFetch(t, fetchOpts{
+				usage:   usageSrv,
+				profile: profileSrv,
+				live:    live,
+				warn:    &warnBuf,
+			})
+			wantErrIs(t, err, providers.ErrTransient)
+			wantWarn(t, &warnBuf, "live row without storing")
 		}},
 		{"auth denied only nil error", func(t *testing.T) {
 			// Single stored account, usage returns 401 (auth-denied), no transient
 			// failures → successCount==0, transientCount==0 → provider returns nil
 			// error with per-account error populated. Pins the D8 contract that
 			// ErrAuthDenied is never returned at the provider level from Fetch.
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-
 			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
-			usageSrv := stubStaticServer(t, 401, []byte(`{"error":"unauthorized"}`))
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv := testutil.NewStubServer(t, []byte(`{"error":"unauthorized"}`), 401, nil)
 
-			out, err := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil).Fetch(context.Background())
+			out, err := runFetch(t, fetchOpts{usage: usageSrv, live: live, store: store})
 			if err != nil {
 				t.Errorf("Fetch must return nil error for auth-denied only (D8); got: %v", err)
 			}
-			if len(out.Accounts) != 1 {
-				t.Fatalf("expected 1 account result, got %d", len(out.Accounts))
-			}
+			wantAccounts(t, out, 1)
 			if out.Accounts[0].Error == "" {
 				t.Error("per-account error must be set for auth-denied account")
 			}
@@ -1232,17 +1095,15 @@ func TestFetch_cache(t *testing.T) {
 		{"two accounts cache hit", func(t *testing.T) {
 			// Pre-populate cache for acct A; run Fetch; assert the usage server
 			// saw a request only for acct B.
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
 			live := makeCred("tok-a", "ref-a", 0) // byte-matches acctA
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0),
+			)
 
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
 
@@ -1252,15 +1113,11 @@ func TestFetch_cache(t *testing.T) {
 			})
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if n := usageCount.Load(); n != 1 {
 				t.Errorf("usage server requests = %d, want 1 (only acctB should fire)", n)
 			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			wantAccounts(t, out, 2)
 			// Active account (acctA) should have limits from the cache (no error).
 			for _, ar := range out.Accounts {
 				if ar.UUID == "uuid-a" && ar.Error != "" {
@@ -1273,19 +1130,17 @@ func TestFetch_cache(t *testing.T) {
 			// server saw requests for both accounts.
 			t.Setenv("AISTAT_USAGE_CACHE_TTL", "1s")
 
-			acctA := makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0)
-			acctB := makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acctA)
-			_ = store.Upsert(context.Background(), acctB)
-
 			now := testNow
 			nowFn := func() time.Time { return now }
 			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t,
+				makeAccount("uuid-a", "alpha@example.com", "tok-a", "ref-a", 0),
+				makeAccount("uuid-b", "beta@example.com", "tok-b", "ref-b", 0),
+			)
 
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nowFn)
 
@@ -1296,15 +1151,11 @@ func TestFetch_cache(t *testing.T) {
 			now = now.Add(2 * time.Second)
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if n := usageCount.Load(); n != 2 {
 				t.Errorf("usage server requests = %d, want 2 (both entries expired)", n)
 			}
-			if len(out.Accounts) != 2 {
-				t.Fatalf("Accounts len = %d, want 2", len(out.Accounts))
-			}
+			wantAccounts(t, out, 2)
 		}},
 		{"cache hit recomputes reset after", func(t *testing.T) {
 			// Cached Limit.ResetsAt is absolute; ResetAfterSeconds is recomputed
@@ -1312,17 +1163,14 @@ func TestFetch_cache(t *testing.T) {
 			// Use a 90 s TTL so a 40 s clock advance does not expire the entry.
 			t.Setenv("AISTAT_USAGE_CACHE_TTL", "90s")
 
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
-			live := makeCred("tok-a", "ref-a", 0)
-
 			now := testNow
 			nowFn := func() time.Time { return now }
+			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nowFn)
 
@@ -1336,15 +1184,11 @@ func TestFetch_cache(t *testing.T) {
 			now = now.Add(40 * time.Second)
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if usageCount.Load() != 0 {
 				t.Errorf("usage server should not be hit on cache hit, got %d requests", usageCount.Load())
 			}
-			if len(out.Accounts) != 1 {
-				t.Fatalf("Accounts len = %d, want 1", len(out.Accounts))
-			}
+			wantAccounts(t, out, 1)
 			fh, ok := out.Accounts[0].Limits["five_hour"]
 			if !ok {
 				t.Fatal("five_hour limit missing")
@@ -1362,24 +1206,21 @@ func TestFetch_cache(t *testing.T) {
 			// fetchLimitsFresh regardless of cache state.
 			live := makeCred("tok-live", "ref-live", 0)
 			// Empty store → no byte-match → profile call needed.
-			store := accounts.NewMemoryStore()
 
 			// Profile returns 503 → LiveUnstored branch (no UUID available).
-			profileSrv := stubStaticServer(t, 503, []byte(`{"error":"unavailable"}`))
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.NewStubServer(t, []byte(`{"error":"unavailable"}`), 503, nil)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			var warnBuf bytes.Buffer
-			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, &warnBuf, nil)
+			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, nil, &warnBuf, nil)
 
 			// Pre-populate cache for some UUID — fallback path has no UUID and should
 			// bypass the cache entirely.
 			c.cache.Put("some-uuid", map[string]providers.Limit{"five_hour": {ResetAfterSeconds: 999}})
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if usageCount.Load() != 1 {
 				t.Errorf("usage server requests = %d, want 1 (fresh fetch required, no UUID)", usageCount.Load())
 			}
@@ -1392,14 +1233,12 @@ func TestFetch_cache(t *testing.T) {
 			// (unchanged), so a pre-populated cache entry produces a hit without
 			// any usage server requests.
 			nearExpiry := testNow.Add(5 * time.Second).UnixMilli()
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
 			live := makeCred("tok-a", "ref-a", nearExpiry) // byte-matches
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", nearExpiry))
 
-			refreshSrv := stubStaticServer(t, 200, refreshSuccessBody("tok-a2", "ref-a2"))
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
+			refreshSrv := testutil.NewStubServer(t, refreshSuccessBody("tok-a2", "ref-a2"), 200, nil)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store,
 				nil, func() time.Time { return testNow })
@@ -1411,16 +1250,12 @@ func TestFetch_cache(t *testing.T) {
 			})
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			// Token was rotated (refresh fired) but UUID is unchanged → cache hit.
 			if n := usageCount.Load(); n != 0 {
 				t.Errorf("usage server requests = %d, want 0 (cache hit despite token rotation)", n)
 			}
-			if len(out.Accounts) != 1 {
-				t.Fatalf("Accounts len = %d, want 1", len(out.Accounts))
-			}
+			wantAccounts(t, out, 1)
 			if out.Accounts[0].Error != "" {
 				t.Errorf("account should have no error on cache hit, got: %q", out.Accounts[0].Error)
 			}
@@ -1429,10 +1264,8 @@ func TestFetch_cache(t *testing.T) {
 			// A cache miss triggers a live fetch; the first response is 429
 			// Retry-After: 1; the second succeeds. The account should still
 			// produce limits within the 3 s per-account budget.
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
 			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
 			var callCount atomic.Int32
 			usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1448,8 +1281,8 @@ func TestFetch_cache(t *testing.T) {
 			}))
 			t.Cleanup(usageSrv.Close)
 
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
 
@@ -1469,10 +1302,8 @@ func TestFetch_cache(t *testing.T) {
 			// pool budget (baseTimeout=0, perAccountBudget=3 s) means the second
 			// sleep would exceed the deadline, sleepWithCtx skips the second sleep
 			// → exactly 2 attempts → ErrTransient.
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
 			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
 			// Redirect cache to an isolated dir before constructing the cache.
 			t.Setenv("HOME", t.TempDir())
@@ -1489,8 +1320,8 @@ func TestFetch_cache(t *testing.T) {
 			}))
 			t.Cleanup(usageSrv.Close)
 
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			usageDoer := httpx.NewDoer(usageSrv.Client(), "aistat-test/0", "claude",
 				map[string]string{"Anthropic-Beta": betaHeader}, nil)
@@ -1521,9 +1352,7 @@ func TestFetch_cache(t *testing.T) {
 			out, err := c.Fetch(context.Background())
 			elapsed := time.Since(start)
 
-			if !errors.Is(err, providers.ErrTransient) {
-				t.Errorf("expected ErrTransient, got: %v", err)
-			}
+			wantErrIs(t, err, providers.ErrTransient)
 			if n := callCount.Load(); n != 2 {
 				t.Errorf("usage server calls = %d, want 2 (second sleep skipped by budget check)", n)
 			}
@@ -1549,9 +1378,9 @@ func TestFetchUsage_cache(t *testing.T) {
 			// Pre-populate cache for a UUID; FetchUsage with that UUID reads from
 			// cache, not the live endpoint. Unified-code-path contract for the
 			// switch active-account read.
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil)
 
@@ -1561,9 +1390,7 @@ func TestFetchUsage_cache(t *testing.T) {
 			})
 
 			limits, err := c.FetchUsage(context.Background(), "tok-test", "uuid-x")
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if n := usageCount.Load(); n != 0 {
 				t.Errorf("usage server requests = %d, want 0 (FetchUsage should serve from cache)", n)
 			}
@@ -1574,16 +1401,14 @@ func TestFetchUsage_cache(t *testing.T) {
 		{"empty UUID bypasses cache", func(t *testing.T) {
 			// When uuid is empty (e.g. an unstored live credential), FetchUsage
 			// falls through to a fresh fetch with no cache interaction.
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, nil, nil, nil, nil)
 
 			_, err := c.FetchUsage(context.Background(), "tok-test", "")
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			if n := usageCount.Load(); n != 1 {
 				t.Errorf("usage server requests = %d, want 1 (empty uuid forces fresh fetch)", n)
 			}
@@ -1610,14 +1435,12 @@ func TestNew(t *testing.T) {
 				t.Fatal("WithCacheBypass(true) did not set cacheBypass on Client")
 			}
 
-			acct := makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0)
-			store := accounts.NewMemoryStore()
-			_ = store.Upsert(context.Background(), acct)
 			live := makeCred("tok-a", "ref-a", 0)
+			store := testutil.MemStore(t, makeAccount("uuid-a", "a@example.com", "tok-a", "ref-a", 0))
 
-			usageSrv, usageCount := stubCountingServer(t, 200, minUsageBody)
-			profileSrv := noProfileServer(t)
-			refreshSrv := noRefreshServer(t)
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			profileSrv := testutil.RejectServer(t, "profile")
+			refreshSrv := testutil.RejectServer(t, "refresh")
 
 			c := buildClient(t, usageSrv, profileSrv, refreshSrv, live, store, nil, nil)
 
@@ -1630,9 +1453,7 @@ func TestNew(t *testing.T) {
 			c.cacheBypass = true
 
 			out, err := c.Fetch(context.Background())
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
+			wantNoErr(t, err)
 			// Bypass skips read → usage server must be hit.
 			if n := usageCount.Load(); n != 1 {
 				t.Errorf("usage server requests = %d, want 1 (bypass skips cache read)", n)

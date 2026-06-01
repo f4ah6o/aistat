@@ -139,15 +139,9 @@ func TestSwitchTo(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest("--to", "personal") // email-substring match
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "switched to personal@example.com (uuid uuid-personal)") {
-				t.Errorf("unexpected stdout: %q", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "was work@example.com") {
-				t.Errorf("missing 'was' part: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to personal@example.com (uuid uuid-personal)")
+			wantOut(t, r, "was work@example.com")
 
 			// Written blob must match personal account's RawBlob.
 			personal := getAccountFromStore(t, ms, "uuid-personal")
@@ -173,12 +167,8 @@ func TestSwitchTo(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest("--to", "aaaa1111") // UUID-prefix (8 hex chars)
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "aaaa1111-2222-3333-4444-555555555555") {
-				t.Errorf("UUID not in output: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "aaaa1111-2222-3333-4444-555555555555")
 
 			personal := getAccountFromStore(t, ms, "aaaa1111-2222-3333-4444-555555555555")
 			if !bytes.Equal(*written, []byte(personal.RawBlob)) {
@@ -196,12 +186,8 @@ func TestSwitchTo(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest("--to", "personal")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
-			if !strings.Contains(r.stdout, "already on personal@example.com") {
-				t.Errorf("wrong stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on personal@example.com")
 			if *written != nil {
 				t.Error("writeClaudeLiveBlob should not have been called")
 			}
@@ -212,12 +198,8 @@ func TestSwitchTo(t *testing.T) {
 			withSwitchActiveUUID(t, "uuid-work")
 
 			r := runSwitchTest("--to", "nobody@example.com")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, `no stored account matches "nobody@example.com"`) {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, `no stored account matches "nobody@example.com"`)
 		}},
 		{"multiple matches disambiguate error", func(t *testing.T) {
 			ms := withMemoryStore(t)
@@ -228,12 +210,8 @@ func TestSwitchTo(t *testing.T) {
 			withSwitchActiveUUID(t, "uuid-a")
 
 			r := runSwitchTest("--to", "example")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, `multiple stored accounts match "example", disambiguate by uuid`) {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, `multiple stored accounts match "example", disambiguate by uuid`)
 		}},
 		{"write error no reconcile", func(t *testing.T) {
 			ms := withMemoryStore(t)
@@ -248,12 +226,8 @@ func TestSwitchTo(t *testing.T) {
 			*writeErrPtr = errors.New("keychain locked")
 
 			r := runSwitchTest("--to", "personal")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "aistat: claude: write to live credential failed: keychain locked") {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: write to live credential failed: keychain locked")
 			// ReconcileAndPersist must NOT have been called (store must be unchanged).
 			if stub.reconcileCalled {
 				t.Error("ReconcileAndPersist must not be called when write fails")
@@ -267,12 +241,8 @@ func TestSwitchTo(t *testing.T) {
 			t.Cleanup(func() { openAccountStore = old })
 
 			r := runSwitchTest("--to", "anyone")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "aistat: claude: could not open account store: disk unavailable") {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: could not open account store: disk unavailable")
 		}},
 		{"store list failure errors", func(t *testing.T) {
 			old := openAccountStore
@@ -283,12 +253,8 @@ func TestSwitchTo(t *testing.T) {
 			withCodexMemoryStore(t) // empty Codex store for determinism
 
 			r := runSwitchTest("--to", "anyone")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "aistat: claude: could not list accounts: disk I/O error") {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: could not list accounts: disk I/O error")
 		}},
 	}
 	for _, tt := range tests {
@@ -309,12 +275,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			withSwitchActiveUUID(t, "")
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-				t.Errorf("missing expected message: %q", r.stderr)
-			}
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
 		}},
 		{"higher headroom wins", func(t *testing.T) {
 			ms := withMemoryStore(t)
@@ -337,15 +299,9 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "switched to personal@example.com") {
-				t.Errorf("unexpected stdout: %q", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "was work@example.com") {
-				t.Errorf("missing 'was' part: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to personal@example.com")
+			wantOut(t, r, "was work@example.com")
 			personal := getAccountFromStore(t, ms, "uuid-personal")
 			if !bytes.Equal(*written, []byte(personal.RawBlob)) {
 				t.Errorf("written blob mismatch")
@@ -373,12 +329,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "already on best account (personal@example.com)") {
-				t.Errorf("wrong stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on best account (personal@example.com)")
 			if *written != nil {
 				t.Error("writeClaudeLiveBlob should not have been called when active is already best")
 			}
@@ -409,13 +361,9 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			// accountB should win (same bucket as A, but more recent LastSeenAt).
-			if !strings.Contains(r.stdout, "accountb@example.com") {
-				t.Errorf("expected accountB to win, got stdout: %q", r.stdout)
-			}
+			wantOut(t, r, "accountb@example.com")
 			accountB := getAccountFromStore(t, ms, "uuid-b")
 			if !bytes.Equal(*written, []byte(accountB.RawBlob)) {
 				t.Errorf("written blob does not match accountB's RawBlob")
@@ -443,12 +391,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "good@example.com") {
-				t.Errorf("expected good to win, got stdout: %q", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "good@example.com")
 			good := getAccountFromStore(t, ms, "uuid-good")
 			if !bytes.Equal(*written, []byte(good.RawBlob)) {
 				t.Errorf("written blob mismatch")
@@ -469,12 +413,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "auto-pick failed: no accounts produced usable usage data") {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "auto-pick failed: no accounts produced usable usage data")
 			if *written != nil {
 				t.Error("writeClaudeLiveBlob should not have been called")
 			}
@@ -494,12 +434,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			written, _ := withWriteBlob(t)
 
 			r := runSwitchTest()
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "aistat: claude: auto-pick usage fetch failed: network timeout") {
-				t.Errorf("wrong error: %q", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: auto-pick usage fetch failed: network timeout")
 			if *written != nil {
 				t.Error("writeClaudeLiveBlob should not have been called")
 			}
@@ -511,12 +447,8 @@ func TestSwitchAutoPick(t *testing.T) {
 			withSwitchActiveUUID(t, "uuid-personal")
 
 			r := runSwitchTest()
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-				t.Errorf("missing expected message: %q", r.stderr)
-			}
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
 		}},
 	}
 	for _, tt := range tests {
@@ -566,19 +498,10 @@ func TestSwitchPostSwitchVerify(t *testing.T) {
 			}
 
 			r := runSwitchTest("codex", "--to", "alice")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "switched to") {
-				t.Errorf("expected 'switched to' in stdout: %q", r.stdout)
-			}
-			wantSubstr := "aistat: codex: switched-to account's tokens are not usable: alice@example.com:"
-			if !strings.Contains(r.stderr, wantSubstr) {
-				t.Errorf("expected %q in stderr: %q", wantSubstr, r.stderr)
-			}
-			if !strings.Contains(r.stderr, "tokens revoked") {
-				t.Errorf("expected 'tokens revoked' in stderr: %q", r.stderr)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to")
+			wantErrOut(t, r, "aistat: codex: switched-to account's tokens are not usable: alice@example.com:")
+			wantErrOut(t, r, "tokens revoked")
 			if strings.Count(r.stderr, "aistat: codex:") != 1 {
 				t.Errorf("expected exactly one 'aistat: codex:' in stderr, got %d: %q",
 					strings.Count(r.stderr, "aistat: codex:"), r.stderr)
@@ -591,9 +514,7 @@ func TestSwitchPostSwitchVerify(t *testing.T) {
 			}
 
 			r := runSwitchTest("codex", "--to", "alice")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
+			wantExit(t, r, 0)
 			if strings.Contains(r.stderr, "tokens are not usable") {
 				t.Errorf("transient error should be silenced; stderr: %q", r.stderr)
 			}
@@ -602,9 +523,7 @@ func TestSwitchPostSwitchVerify(t *testing.T) {
 			scaffoldCodexSwitch(t) // postSwitchVerifyFn unset → returns nil
 
 			r := runSwitchTest("codex", "--to", "alice")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
+			wantExit(t, r, 0)
 			if strings.Contains(r.stderr, "tokens are not usable") {
 				t.Errorf("nil verify should produce no warning; stderr: %q", r.stderr)
 			}
@@ -616,9 +535,7 @@ func TestSwitchPostSwitchVerify(t *testing.T) {
 			}
 
 			r := runSwitchTest("codex", "--to", "alice")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
+			wantExit(t, r, 0)
 			if strings.Contains(r.stderr, "tokens are not usable") {
 				t.Errorf("non-wrapping error should be silenced; stderr: %q", r.stderr)
 			}

@@ -17,6 +17,30 @@ type runResult struct {
 	code   int
 }
 
+// wantExit asserts r.code == want, else fails the test with Fatalf.
+func wantExit(t *testing.T, r runResult, want int) {
+	t.Helper()
+	if r.code != want {
+		t.Fatalf("expected exit %d, got %d\nstdout: %s\nstderr: %s", want, r.code, r.stdout, r.stderr)
+	}
+}
+
+// wantOut asserts strings.Contains(r.stdout, sub), else fails with Errorf.
+func wantOut(t *testing.T, r runResult, sub string) {
+	t.Helper()
+	if !strings.Contains(r.stdout, sub) {
+		t.Errorf("stdout missing %q\nstdout: %s", sub, r.stdout)
+	}
+}
+
+// wantErrOut asserts strings.Contains(r.stderr, sub), else fails with Errorf.
+func wantErrOut(t *testing.T, r runResult, sub string) {
+	t.Helper()
+	if !strings.Contains(r.stderr, sub) {
+		t.Errorf("stderr missing %q\nstderr: %s", sub, r.stderr)
+	}
+}
+
 // runCLI invokes run() in-process so tests do not pay the per-test go-build
 // cost a subprocess approach would. Tests that need --fake live in
 // main_fake_test.go (build-tagged) so they only run under -tags=fake.
@@ -48,27 +72,17 @@ func TestCLIHelpVersion(t *testing.T) {
 	}{
 		{"help flag", func(t *testing.T) {
 			r := runCLI("--help")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
-			if !strings.Contains(r.stdout, "aistat") {
-				t.Fatalf("help missing program name: %s", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "-h, --human") {
-				t.Fatalf("help missing -h, --human: %s", r.stdout)
-			}
-			if !strings.Contains(r.stdout, "accounts") {
-				t.Fatalf("help missing accounts subcommand: %s", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "aistat")
+			wantOut(t, r, "-h, --human")
+			wantOut(t, r, "accounts")
 			if r.stderr != "" {
 				t.Fatalf("stderr should be empty on --help: %s", r.stderr)
 			}
 		}},
 		{"version flag", func(t *testing.T) {
 			r := runCLI("--version")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			if got := strings.TrimSpace(r.stdout); got == "" {
 				t.Fatalf("expected non-empty version, got empty")
 			}
@@ -76,9 +90,7 @@ func TestCLIHelpVersion(t *testing.T) {
 		{"help lists all known providers", func(t *testing.T) {
 			r := runCLI("--help")
 			for _, id := range []string{"claude", "codex", "copilot"} {
-				if !strings.Contains(r.stdout, id) {
-					t.Errorf("help missing provider %q: %s", id, r.stdout)
-				}
+				wantOut(t, r, id)
 			}
 		}},
 	}
@@ -105,15 +117,9 @@ func TestCLIGlobalFlags(t *testing.T) {
 		}},
 		{"equal form rejected", func(t *testing.T) {
 			r := runCLI("--debug=true", "usage")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "--flag=value form not supported for global flags") {
-				t.Fatalf("missing error message: %s", r.stderr)
-			}
-			if !strings.Contains(r.stderr, "--debug") {
-				t.Fatalf("error should name the offending flag: %s", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "--flag=value form not supported for global flags")
+			wantErrOut(t, r, "--debug")
 		}},
 		{"human flag placement equivalence", func(t *testing.T) {
 			// --human before subcommand and after subcommand are both accepted.
@@ -142,40 +148,28 @@ func TestCLIBadInput(t *testing.T) {
 	}{
 		{"unknown subcommand", func(t *testing.T) {
 			r := runCLI("unknown-subcmd")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
+			wantExit(t, r, 2)
 			if r.stdout != "" {
 				t.Fatalf("stdout should be empty: %s", r.stdout)
 			}
-			if !strings.Contains(r.stderr, `unknown subcommand "unknown-subcmd"`) {
-				t.Fatalf("missing error: %s", r.stderr)
-			}
+			wantErrOut(t, r, `unknown subcommand "unknown-subcmd"`)
 		}},
 		{"unknown flag", func(t *testing.T) {
 			// Unknown flag left in rest by scanGlobals → passed to runUsage's FlagSet.
 			r := runCLI("--unknown")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
+			wantExit(t, r, 2)
 			if r.stdout != "" {
 				t.Fatalf("stdout should be empty: %s", r.stdout)
 			}
-			if !strings.Contains(r.stderr, "flag provided but not defined") {
-				t.Fatalf("missing parse error: %s", r.stderr)
-			}
+			wantErrOut(t, r, "flag provided but not defined")
 		}},
 		{"dropped json flag", func(t *testing.T) {
 			r := runCLI("--json")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
+			wantExit(t, r, 2)
 			if r.stdout != "" {
 				t.Fatalf("stdout must be empty: %s", r.stdout)
 			}
-			if !strings.Contains(r.stderr, "flag provided but not defined") {
-				t.Fatalf("missing parse error: %s", r.stderr)
-			}
+			wantErrOut(t, r, "flag provided but not defined")
 		}},
 	}
 	for _, tt := range tests {
@@ -214,12 +208,8 @@ func TestCLIUsage(t *testing.T) {
 		}},
 		{"unknown provider errors", func(t *testing.T) {
 			r := runCLI("usage", "unknown-provider")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "usage unknown-provider: provider must be one of claude, codex, copilot") {
-				t.Fatalf("missing error: %s", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "usage unknown-provider: provider must be one of claude, codex, copilot")
 		}},
 	}
 	for _, tt := range tests {
@@ -236,12 +226,8 @@ func TestCLISwitch(t *testing.T) {
 	}{
 		{"help flag", func(t *testing.T) {
 			r := runCLI("switch", "--help")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
-			}
-			if !strings.Contains(r.stdout, "aistat") {
-				t.Fatalf("help output missing 'aistat': %s", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "aistat")
 		}},
 		{"no stored accounts bulk exit 0", func(t *testing.T) {
 			// Bulk switch with both stores empty → no eligible providers → exit 0.
@@ -249,12 +235,8 @@ func TestCLISwitch(t *testing.T) {
 			withCodexMemoryStore(t)
 
 			r := runCLI("switch")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-				t.Fatalf("missing expected message: %s", r.stderr)
-			}
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
 		}},
 		{"claude one account shows login hint", func(t *testing.T) {
 			ms := withMemoryStore(t)
@@ -263,12 +245,8 @@ func TestCLISwitch(t *testing.T) {
 			withSwitchActiveUUID(t, "uuid-only")
 
 			r := runCLI("switch", "claude")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "claude /login") {
-				t.Fatalf("missing Claude login hint: %s", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "claude /login")
 		}},
 	}
 	for _, tt := range tests {
@@ -286,21 +264,14 @@ func TestCLIAccounts(t *testing.T) {
 		{"no subcommand errors", func(t *testing.T) {
 			withMemoryStore(t)
 			r := runCLI("accounts")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			want := "unknown subcommand \"\" — want \"list\" or \"remove\""
-			if !strings.Contains(r.stderr, want) {
-				t.Fatalf("missing error %q: %s", want, r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "unknown subcommand \"\" — want \"list\" or \"remove\"")
 		}},
 		{"list empty stores json", func(t *testing.T) {
 			withMemoryStore(t)
 			withCodexMemoryStore(t)
 			r := runCLI("accounts", "list")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			// JSON output for empty stores: both provider keys present.
 			var result map[string]any
 			if err := json.Unmarshal([]byte(r.stdout), &result); err != nil {
@@ -313,19 +284,13 @@ func TestCLIAccounts(t *testing.T) {
 		{"list help flag", func(t *testing.T) {
 			withMemoryStore(t)
 			r := runCLI("accounts", "list", "--help")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
-			if !strings.Contains(r.stdout, "aistat") {
-				t.Fatalf("help output missing 'aistat': %s", r.stdout)
-			}
+			wantExit(t, r, 0)
+			wantOut(t, r, "aistat")
 		}},
 		{"list version flag", func(t *testing.T) {
 			withMemoryStore(t)
 			r := runCLI("accounts", "list", "--version")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d", r.code)
-			}
+			wantExit(t, r, 0)
 			if got := strings.TrimSpace(r.stdout); got == "" {
 				t.Fatalf("expected non-empty version, got empty")
 			}
@@ -334,9 +299,7 @@ func TestCLIAccounts(t *testing.T) {
 			withMemoryStore(t)
 			withCodexMemoryStore(t)
 			r := runCLI("accounts", "list", "claude")
-			if r.code != 0 {
-				t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
-			}
+			wantExit(t, r, 0)
 			var result map[string]any
 			if err := json.Unmarshal([]byte(r.stdout), &result); err != nil {
 				t.Fatalf("expected valid JSON, got %q: %v", r.stdout, err)
@@ -352,12 +315,8 @@ func TestCLIAccounts(t *testing.T) {
 			withMemoryStore(t)
 			withCodexMemoryStore(t)
 			r := runCLI("accounts", "remove", "some-id", "bogus")
-			if r.code != 2 {
-				t.Fatalf("expected exit 2, got %d", r.code)
-			}
-			if !strings.Contains(r.stderr, "unknown provider") {
-				t.Fatalf("missing unknown provider error: %s", r.stderr)
-			}
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "unknown provider")
 		}},
 	}
 	for _, tt := range tests {
