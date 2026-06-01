@@ -36,111 +36,258 @@ func makeLimits(resetsAt time.Time) map[string]providers.Limit {
 	}
 }
 
-func TestCache_RoundTrip(t *testing.T) {
-	resetsAt := time.Unix(1748448000, 0).UTC()
-	limits := makeLimits(resetsAt)
+// TestCache_GetPut covers the core Get/Put contract: round-trip fidelity,
+// unknown-UUID miss, expiry eviction, and ResetsAt field preservation.
+func TestCache_GetPut(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"round trip", func(t *testing.T) {
+			resetsAt := time.Unix(1748448000, 0).UTC()
+			limits := makeLimits(resetsAt)
 
-	c := setupTestCache(t, nil, nil)
+			c := setupTestCache(t, nil, nil)
 
-	c.Put("uuid-1", limits)
-	got, ok := c.Get("uuid-1")
-	if !ok {
-		t.Fatal("Get after Put: want hit, got miss")
+			c.Put("uuid-1", limits)
+			got, ok := c.Get("uuid-1")
+			if !ok {
+				t.Fatal("Get after Put: want hit, got miss")
+			}
+			if len(got) != len(limits) {
+				t.Fatalf("Get: got %d entries, want %d", len(got), len(limits))
+			}
+			l := got["five_hour"]
+			if l.UsedPercent != 25.0 || l.RemainingPercent != 75.0 || l.ResetAfterSeconds != 3600 {
+				t.Errorf("Get: numeric fields mismatch: %+v", l)
+			}
+		}},
+		{"get unknown uuid", func(t *testing.T) {
+			c := setupTestCache(t, nil, nil)
+			got, ok := c.Get("nonexistent-uuid")
+			if got != nil || ok {
+				t.Errorf("Get unknown UUID: want (nil, false), got (%v, %v)", got, ok)
+			}
+		}},
+		{"expired entry", func(t *testing.T) {
+			now := time.Unix(1748448000, 0).UTC()
+			nowFn := func() time.Time { return now }
+
+			c := setupTestCache(t, nowFn, nil)
+			c.Put("uuid-1", makeLimits(now.Add(3600*time.Second)))
+
+			// Advance past TTL
+			now = now.Add(c.ttl + time.Second)
+
+			got, ok := c.Get("uuid-1")
+			if got != nil || ok {
+				t.Errorf("Get expired entry: want (nil, false), got (%v, %v)", got, ok)
+			}
+		}},
+		{"resets at preserved", func(t *testing.T) {
+			resetsAt := time.Unix(1748448000, 0).UTC()
+			limits := map[string]providers.Limit{
+				"five_hour": {
+					UsedPercent:       50.0,
+					RemainingPercent:  50.0,
+					ResetsAt:          resetsAt,
+					ResetAfterSeconds: 7200,
+				},
+			}
+
+			c := setupTestCache(t, nil, nil)
+			c.Put("uuid-1", limits)
+
+			got, ok := c.Get("uuid-1")
+			if !ok {
+				t.Fatal("Get after Put: miss")
+			}
+			if !got["five_hour"].ResetsAt.Equal(resetsAt) {
+				t.Errorf("ResetsAt not preserved: want %v, got %v", resetsAt, got["five_hour"].ResetsAt)
+			}
+		}},
 	}
-	if len(got) != len(limits) {
-		t.Fatalf("Get: got %d entries, want %d", len(got), len(limits))
-	}
-	l := got["five_hour"]
-	if l.UsedPercent != 25.0 || l.RemainingPercent != 75.0 || l.ResetAfterSeconds != 3600 {
-		t.Errorf("Get: numeric fields mismatch: %+v", l)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
-func TestCache_GetUnknownUUID(t *testing.T) {
-	c := setupTestCache(t, nil, nil)
-	got, ok := c.Get("nonexistent-uuid")
-	if got != nil || ok {
-		t.Errorf("Get unknown UUID: want (nil, false), got (%v, %v)", got, ok)
+// TestCache_Corrupt covers corrupt-file behavior: a Get on a corrupt file
+// returns a miss and fires exactly one warn, and a Put over a corrupt file
+// discards the corrupt state and writes only the new entry.
+func TestCache_Corrupt(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"corrupt file get", func(t *testing.T) {
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+
+			c := setupTestCache(t, nil, warnFn)
+
+			// Write corrupt JSON directly to the data file.
+			if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			got, ok := c.Get("uuid-1")
+			if got != nil || ok {
+				t.Errorf("Get on corrupt file: want (nil, false), got (%v, %v)", got, ok)
+			}
+			if len(warns) != 1 {
+				t.Errorf("warn count after corrupt Get: want 1, got %d", len(warns))
+			}
+
+			// Second Get does not fire warn again.
+			c.Get("uuid-1")
+			if len(warns) != 1 {
+				t.Errorf("warn count after second Get: want 1, got %d (once must suppress)", len(warns))
+			}
+		}},
+		{"corrupt overwrite on put", func(t *testing.T) {
+			c := setupTestCache(t, nil, nil)
+			resetsAt := time.Unix(1748448000, 0).UTC()
+
+			// Establish uuid-2 in a valid file first.
+			c.Put("uuid-2", makeLimits(resetsAt))
+			if _, ok := c.Get("uuid-2"); !ok {
+				t.Fatal("precondition: uuid-2 not found before corruption")
+			}
+
+			// Corrupt the file externally.
+			if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			// Put uuid-1: reads the corrupt file, discards it, overwrites via atomic
+			// rename with only the new entry. uuid-2 is intentionally lost — the cache
+			// is fail-open and entries will be repopulated on their next fetch.
+			c.Put("uuid-1", makeLimits(resetsAt))
+
+			got, ok := c.Get("uuid-1")
+			if !ok {
+				t.Fatal("Get uuid-1 after Put-over-corrupt: want hit, got miss")
+			}
+			if len(got) == 0 {
+				t.Error("Get uuid-1 after Put-over-corrupt: empty limits")
+			}
+
+			// uuid-2 was lost when the corrupt file was overwritten.
+			_, ok = c.Get("uuid-2")
+			if ok {
+				t.Error("Get uuid-2 after corrupt overwrite: want miss (data lost), got hit")
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
-func TestCache_ExpiredEntry(t *testing.T) {
-	now := time.Unix(1748448000, 0).UTC()
-	nowFn := func() time.Time { return now }
+// TestCache_DisabledCache covers the two paths that produce a disabled cache:
+// a blocked cache directory and an invalid provider string. Both must be silent
+// at construction and fire exactly one warn on first use.
+func TestCache_DisabledCache(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"blocked dir", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
 
-	c := setupTestCache(t, nowFn, nil)
-	c.Put("uuid-1", makeLimits(now.Add(3600*time.Second)))
+			// Resolve the cache dir path, then block it by creating a file in its place.
+			cacheBase, err := os.UserCacheDir()
+			if err != nil {
+				t.Fatalf("os.UserCacheDir: %v", err)
+			}
+			// Create the "aistat" ancestor as a regular file so MkdirAll("aistat/usage") fails.
+			ancestor := filepath.Join(cacheBase, "aistat")
+			if err := os.MkdirAll(filepath.Dir(ancestor), 0700); err != nil {
+				t.Fatalf("MkdirAll ancestor parent: %v", err)
+			}
+			if err := os.WriteFile(ancestor, []byte("block"), 0600); err != nil {
+				t.Fatalf("WriteFile ancestor: %v", err)
+			}
 
-	// Advance past TTL
-	now = now.Add(c.ttl + time.Second)
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+			c := New("claude", nil, warnFn)
 
-	got, ok := c.Get("uuid-1")
-	if got != nil || ok {
-		t.Errorf("Get expired entry: want (nil, false), got (%v, %v)", got, ok)
+			if !c.disabled {
+				t.Fatal("expected disabled cache when dir is blocked")
+			}
+
+			// Warn must NOT fire at construction — only on first use.
+			if len(warns) != 0 {
+				t.Errorf("warn fired at construction: want 0, got %d: %v", len(warns), warns)
+			}
+
+			// First Get fires the warn.
+			got, ok := c.Get("any-uuid")
+			if got != nil || ok {
+				t.Errorf("disabled Get: want (nil, false), got (%v, %v)", got, ok)
+			}
+			if len(warns) != 1 {
+				t.Errorf("warn count after first Get: want 1, got %d", len(warns))
+			}
+
+			// Subsequent calls are silent.
+			c.Get("any-uuid")
+			c.Put("any-uuid", nil)
+			if len(warns) != 1 {
+				t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
+			}
+		}},
+		{"invalid provider", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
+
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+
+			c := New("../attack", nil, warnFn)
+			if !c.disabled {
+				t.Fatal("expected disabled cache for invalid provider")
+			}
+
+			// Warn must NOT fire at construction — only on first use.
+			if len(warns) != 0 {
+				t.Fatalf("warn fired at construction: want 0, got %d", len(warns))
+			}
+
+			got, ok := c.Get("any-uuid")
+			if got != nil || ok {
+				t.Errorf("disabled Get: want (nil, false), got (%v, %v)", got, ok)
+			}
+			if len(warns) != 1 {
+				t.Fatalf("warn count after Get: want 1, got %d", len(warns))
+			}
+			if !strings.Contains(warns[0], "../attack") {
+				t.Errorf("warn message does not contain invalid name: %q", warns[0])
+			}
+			// The invalid-provider format intentionally omits a provider prefix; the
+			// invalid string lives inside the parenthesized reason instead.
+			if !strings.HasPrefix(warns[0], "aistat: usage cache disabled") {
+				t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: usage cache disabled")
+			}
+
+			// Second call and Put are silent.
+			c.Get("any-uuid")
+			c.Put("any-uuid", nil)
+			if len(warns) != 1 {
+				t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
+			}
+		}},
 	}
-}
-
-func TestCache_CorruptFile(t *testing.T) {
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-
-	c := setupTestCache(t, nil, warnFn)
-
-	// Write corrupt JSON directly to the data file.
-	if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	got, ok := c.Get("uuid-1")
-	if got != nil || ok {
-		t.Errorf("Get on corrupt file: want (nil, false), got (%v, %v)", got, ok)
-	}
-	if len(warns) != 1 {
-		t.Errorf("warn count after corrupt Get: want 1, got %d", len(warns))
-	}
-
-	// Second Get does not fire warn again.
-	c.Get("uuid-1")
-	if len(warns) != 1 {
-		t.Errorf("warn count after second Get: want 1, got %d (once must suppress)", len(warns))
-	}
-}
-
-func TestCache_CorruptOverwritesOnPut(t *testing.T) {
-	c := setupTestCache(t, nil, nil)
-	resetsAt := time.Unix(1748448000, 0).UTC()
-
-	// Establish uuid-2 in a valid file first.
-	c.Put("uuid-2", makeLimits(resetsAt))
-	if _, ok := c.Get("uuid-2"); !ok {
-		t.Fatal("precondition: uuid-2 not found before corruption")
-	}
-
-	// Corrupt the file externally.
-	if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-
-	// Put uuid-1: reads the corrupt file, discards it, overwrites via atomic
-	// rename with only the new entry. uuid-2 is intentionally lost — the cache
-	// is fail-open and entries will be repopulated on their next fetch.
-	c.Put("uuid-1", makeLimits(resetsAt))
-
-	got, ok := c.Get("uuid-1")
-	if !ok {
-		t.Fatal("Get uuid-1 after Put-over-corrupt: want hit, got miss")
-	}
-	if len(got) == 0 {
-		t.Error("Get uuid-1 after Put-over-corrupt: empty limits")
-	}
-
-	// uuid-2 was lost when the corrupt file was overwritten.
-	_, ok = c.Get("uuid-2")
-	if ok {
-		t.Error("Get uuid-2 after corrupt overwrite: want miss (data lost), got hit")
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
@@ -158,94 +305,6 @@ func TestCache_ConcurrentPuts(t *testing.T) {
 	_, okB := c.Get("uuid-b")
 	if !okA || !okB {
 		t.Errorf("concurrent Puts: want both UUIDs present; uuid-a=%v uuid-b=%v", okA, okB)
-	}
-}
-
-func TestCache_Disabled(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	// Resolve the cache dir path, then block it by creating a file in its place.
-	cacheBase, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatalf("os.UserCacheDir: %v", err)
-	}
-	// Create the "aistat" ancestor as a regular file so MkdirAll("aistat/usage") fails.
-	ancestor := filepath.Join(cacheBase, "aistat")
-	if err := os.MkdirAll(filepath.Dir(ancestor), 0700); err != nil {
-		t.Fatalf("MkdirAll ancestor parent: %v", err)
-	}
-	if err := os.WriteFile(ancestor, []byte("block"), 0600); err != nil {
-		t.Fatalf("WriteFile ancestor: %v", err)
-	}
-
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-	c := New("claude", nil, warnFn)
-
-	if !c.disabled {
-		t.Fatal("expected disabled cache when dir is blocked")
-	}
-
-	// Warn must NOT fire at construction — only on first use.
-	if len(warns) != 0 {
-		t.Errorf("warn fired at construction: want 0, got %d: %v", len(warns), warns)
-	}
-
-	// First Get fires the warn.
-	got, ok := c.Get("any-uuid")
-	if got != nil || ok {
-		t.Errorf("disabled Get: want (nil, false), got (%v, %v)", got, ok)
-	}
-	if len(warns) != 1 {
-		t.Errorf("warn count after first Get: want 1, got %d", len(warns))
-	}
-
-	// Subsequent calls are silent.
-	c.Get("any-uuid")
-	c.Put("any-uuid", nil)
-	if len(warns) != 1 {
-		t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
-	}
-}
-
-// TestCache_PathNaming pins the exact on-disk location for the claude data file.
-// This is the provider-neutral equivalent of the old claude-package path test.
-func TestCache_PathNaming(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	cacheBase, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatalf("os.UserCacheDir: %v", err)
-	}
-
-	c := New("claude", nil, nil)
-
-	wantPath := filepath.Join(cacheBase, "aistat", "usage", "claude-v1.json")
-	if c.path != wantPath {
-		t.Errorf("cache path: got %q, want %q", c.path, wantPath)
-	}
-}
-
-// TestCache_LockNaming pins the exact on-disk location for the claude lock file.
-func TestCache_LockNaming(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	cacheBase, err := os.UserCacheDir()
-	if err != nil {
-		t.Fatalf("os.UserCacheDir: %v", err)
-	}
-
-	c := New("claude", nil, nil)
-
-	wantLock := filepath.Join(cacheBase, "aistat", "usage", "claude.cache.lock")
-	if c.lockPath != wantLock {
-		t.Errorf("lock path: got %q, want %q", c.lockPath, wantLock)
 	}
 }
 
@@ -278,154 +337,49 @@ func TestCache_TTLEnvVar(t *testing.T) {
 	}
 }
 
-func TestCache_ResetsAtPreserved(t *testing.T) {
-	resetsAt := time.Unix(1748448000, 0).UTC()
-	limits := map[string]providers.Limit{
-		"five_hour": {
-			UsedPercent:       50.0,
-			RemainingPercent:  50.0,
-			ResetsAt:          resetsAt,
-			ResetAfterSeconds: 7200,
-		},
-	}
+// TestCache_Naming pins the exact on-disk locations for the data file and lock file.
+func TestCache_Naming(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"path", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
 
-	c := setupTestCache(t, nil, nil)
-	c.Put("uuid-1", limits)
+			cacheBase, err := os.UserCacheDir()
+			if err != nil {
+				t.Fatalf("os.UserCacheDir: %v", err)
+			}
 
-	got, ok := c.Get("uuid-1")
-	if !ok {
-		t.Fatal("Get after Put: miss")
-	}
-	if !got["five_hour"].ResetsAt.Equal(resetsAt) {
-		t.Errorf("ResetsAt not preserved: want %v, got %v", resetsAt, got["five_hour"].ResetsAt)
-	}
-}
+			c := New("claude", nil, nil)
 
-// TestCache_WarnPrefix asserts that warn strings emitted by a "claude" cache
-// are prefixed with "aistat: claude: usage cache".
-func TestCache_WarnPrefix(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
+			wantPath := filepath.Join(cacheBase, "aistat", "usage", "claude-v1.json")
+			if c.path != wantPath {
+				t.Errorf("cache path: got %q, want %q", c.path, wantPath)
+			}
+		}},
+		{"lock", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
 
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
+			cacheBase, err := os.UserCacheDir()
+			if err != nil {
+				t.Fatalf("os.UserCacheDir: %v", err)
+			}
 
-	c := New("claude", nil, warnFn)
+			c := New("claude", nil, nil)
 
-	// Force a corrupt file to trigger the corrupt-file warn.
-	if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
-		t.Fatalf("mkdir: %v", err)
+			wantLock := filepath.Join(cacheBase, "aistat", "usage", "claude.cache.lock")
+			if c.lockPath != wantLock {
+				t.Errorf("lock path: got %q, want %q", c.lockPath, wantLock)
+			}
+		}},
 	}
-	if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	c.Get("uuid-1")
-	if len(warns) != 1 {
-		t.Fatalf("want 1 warn, got %d: %v", len(warns), warns)
-	}
-	if !strings.HasPrefix(warns[0], "aistat: claude: usage cache") {
-		t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache")
-	}
-}
-
-// TestCache_InvalidProvider asserts that an invalid provider string returns a
-// disabled cache that warns once with the invalid name in the message.
-func TestCache_InvalidProvider(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-
-	c := New("../attack", nil, warnFn)
-	if !c.disabled {
-		t.Fatal("expected disabled cache for invalid provider")
-	}
-
-	// Warn must NOT fire at construction — only on first use.
-	if len(warns) != 0 {
-		t.Fatalf("warn fired at construction: want 0, got %d", len(warns))
-	}
-
-	got, ok := c.Get("any-uuid")
-	if got != nil || ok {
-		t.Errorf("disabled Get: want (nil, false), got (%v, %v)", got, ok)
-	}
-	if len(warns) != 1 {
-		t.Fatalf("warn count after Get: want 1, got %d", len(warns))
-	}
-	if !strings.Contains(warns[0], "../attack") {
-		t.Errorf("warn message does not contain invalid name: %q", warns[0])
-	}
-	// The invalid-provider format intentionally omits a provider prefix; the
-	// invalid string lives inside the parenthesized reason instead.
-	if !strings.HasPrefix(warns[0], "aistat: usage cache disabled") {
-		t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: usage cache disabled")
-	}
-
-	// Second call and Put are silent.
-	c.Get("any-uuid")
-	c.Put("any-uuid", nil)
-	if len(warns) != 1 {
-		t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
-	}
-}
-
-// TestCache_WarnPrefix_ReadError exercises the read-error warn path
-// ("aistat: claude: usage cache: read error: ..."). Triggered by placing a
-// directory at the cache file path so os.ReadFile fails with EISDIR.
-func TestCache_WarnPrefix_ReadError(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-
-	c := New("claude", nil, warnFn)
-	if err := os.MkdirAll(c.path, 0700); err != nil {
-		t.Fatalf("mkdir at cache path: %v", err)
-	}
-	c.Get("uuid-1")
-	if len(warns) != 1 {
-		t.Fatalf("want 1 warn, got %d: %v", len(warns), warns)
-	}
-	if !strings.HasPrefix(warns[0], "aistat: claude: usage cache: read error:") {
-		t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache: read error:")
-	}
-}
-
-// TestCache_WarnPrefix_WriteFailed exercises the write-failed warn path
-// ("aistat: claude: usage cache: write failed: ..."). Triggered by making
-// the cache directory read-only after the lock file is created but before
-// atomicWrite tries to create the tmp file.
-func TestCache_WarnPrefix_WriteFailed(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("HOME", tmp)
-	t.Setenv("XDG_CACHE_HOME", "")
-
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-
-	c := New("claude", nil, warnFn)
-	// First Put creates the cache dir + lock file.
-	c.Put("uuid-1", nil)
-	if len(warns) != 0 {
-		t.Fatalf("warn fired on first Put: %v", warns)
-	}
-	dir := filepath.Dir(c.path)
-	if err := os.Chmod(dir, 0500); err != nil {
-		t.Fatalf("chmod readonly: %v", err)
-	}
-	defer os.Chmod(dir, 0700) //nolint:errcheck // restore for cleanup
-	c.Put("uuid-2", nil)
-	if len(warns) != 1 {
-		t.Fatalf("want 1 warn after readonly Put, got %d: %v", len(warns), warns)
-	}
-	if !strings.HasPrefix(warns[0], "aistat: claude: usage cache: write failed:") {
-		t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache: write failed:")
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
@@ -471,5 +425,97 @@ func TestCache_CodexIsolation(t *testing.T) {
 	}
 	if _, ok := cCodex.Get("uuid-codex"); !ok {
 		t.Error("codex cache: want hit for uuid-codex, got miss")
+	}
+}
+
+// TestCache_WarnPrefix asserts the warn string prefix and suppression behavior
+// for corrupt-file, read-error, and write-failed paths on a "claude" cache.
+func TestCache_WarnPrefix(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"corrupt file", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
+
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+
+			c := New("claude", nil, warnFn)
+
+			// Force a corrupt file to trigger the corrupt-file warn.
+			if err := os.MkdirAll(filepath.Dir(c.path), 0700); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(c.path, []byte("{not valid json"), 0600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			c.Get("uuid-1")
+			if len(warns) != 1 {
+				t.Fatalf("want 1 warn, got %d: %v", len(warns), warns)
+			}
+			if !strings.HasPrefix(warns[0], "aistat: claude: usage cache") {
+				t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache")
+			}
+		}},
+		// TestCache_WarnPrefix_ReadError exercises the read-error warn path
+		// ("aistat: claude: usage cache: read error: ..."). Triggered by placing a
+		// directory at the cache file path so os.ReadFile fails with EISDIR.
+		{"read error", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
+
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+
+			c := New("claude", nil, warnFn)
+			if err := os.MkdirAll(c.path, 0700); err != nil {
+				t.Fatalf("mkdir at cache path: %v", err)
+			}
+			c.Get("uuid-1")
+			if len(warns) != 1 {
+				t.Fatalf("want 1 warn, got %d: %v", len(warns), warns)
+			}
+			if !strings.HasPrefix(warns[0], "aistat: claude: usage cache: read error:") {
+				t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache: read error:")
+			}
+		}},
+		// TestCache_WarnPrefix_WriteFailed exercises the write-failed warn path
+		// ("aistat: claude: usage cache: write failed: ..."). Triggered by making
+		// the cache directory read-only after the lock file is created but before
+		// atomicWrite tries to create the tmp file.
+		{"write failed", func(t *testing.T) {
+			tmp := t.TempDir()
+			t.Setenv("HOME", tmp)
+			t.Setenv("XDG_CACHE_HOME", "")
+
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+
+			c := New("claude", nil, warnFn)
+			// First Put creates the cache dir + lock file.
+			c.Put("uuid-1", nil)
+			if len(warns) != 0 {
+				t.Fatalf("warn fired on first Put: %v", warns)
+			}
+			dir := filepath.Dir(c.path)
+			if err := os.Chmod(dir, 0500); err != nil {
+				t.Fatalf("chmod readonly: %v", err)
+			}
+			defer os.Chmod(dir, 0700) //nolint:errcheck // restore for cleanup
+			c.Put("uuid-2", nil)
+			if len(warns) != 1 {
+				t.Fatalf("want 1 warn after readonly Put, got %d: %v", len(warns), warns)
+			}
+			if !strings.HasPrefix(warns[0], "aistat: claude: usage cache: write failed:") {
+				t.Errorf("warn prefix: got %q, want prefix %q", warns[0], "aistat: claude: usage cache: write failed:")
+			}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }

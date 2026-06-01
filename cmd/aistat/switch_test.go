@@ -12,6 +12,7 @@ import (
 
 	"github.com/drogers0/aistat/v2/internal/accounts"
 	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/testutil"
 )
 
 // stubSwitchClient implements switchable for tests.
@@ -108,9 +109,7 @@ func makeLimits(fiveHourRemaining float64) map[string]providers.Limit {
 func getAccountFromStore(t *testing.T, ms *accounts.MemoryStore, uuid string) accounts.Account {
 	t.Helper()
 	all, err := ms.List(context.Background())
-	if err != nil {
-		t.Fatalf("getAccountFromStore: List: %v", err)
-	}
+	testutil.WantNoErr(t, err)
 	for _, a := range all {
 		if a.UUID == uuid {
 			return a
@@ -120,399 +119,339 @@ func getAccountFromStore(t *testing.T, ms *accounts.MemoryStore, uuid string) ac
 	return accounts.Account{}
 }
 
-// ---- Test cases ----
+// ---- --to targeted switch tests ----
 
-// Case 1: --to <email-substring> happy path.
-func TestSwitch_ToEmailHappyPath(t *testing.T) {
-	ms := withMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+func TestSwitchTo(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"email happy path", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 
-	withSwitchActiveUUID(t, "uuid-work") // work is currently active
-	stub := &stubSwitchClient{}
-	withSwitchClient(t, stub)
-	written, _ := withWriteBlob(t)
+			withSwitchActiveUUID(t, "uuid-work") // work is currently active
+			stub := &stubSwitchClient{}
+			withSwitchClient(t, stub)
+			written, _ := withWriteBlob(t)
 
-	r := runSwitchTest("--to", "personal") // email-substring match
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+			r := runSwitchTest("--to", "personal") // email-substring match
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to personal@example.com (uuid uuid-personal)")
+			wantOut(t, r, "was work@example.com")
+
+			// Written blob must match personal account's RawBlob.
+			personal := getAccountFromStore(t, ms, "uuid-personal")
+			if !bytes.Equal(*written, []byte(personal.RawBlob)) {
+				t.Errorf("written blob mismatch: got %q, want %q", *written, personal.RawBlob)
+			}
+
+			// ReconcileAndPersist must be called post-write.
+			if !stub.reconcileCalled {
+				t.Error("ReconcileAndPersist was not called after successful write")
+			}
+		}},
+		{"uuid prefix happy path", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			now := time.Now()
+			// Use hex UUIDs so the prefix triggers the uuidish branch.
+			seedAccount(t, ms, "bbbb6666-7777-8888-9999-000000000000", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "aaaa1111-2222-3333-4444-555555555555", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+
+			withSwitchActiveUUID(t, "bbbb6666-7777-8888-9999-000000000000")
+			stub := &stubSwitchClient{}
+			withSwitchClient(t, stub)
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest("--to", "aaaa1111") // UUID-prefix (8 hex chars)
+			wantExit(t, r, 0)
+			wantOut(t, r, "aaaa1111-2222-3333-4444-555555555555")
+
+			personal := getAccountFromStore(t, ms, "aaaa1111-2222-3333-4444-555555555555")
+			if !bytes.Equal(*written, []byte(personal.RawBlob)) {
+				t.Errorf("written blob mismatch")
+			}
+			if !stub.reconcileCalled {
+				t.Error("ReconcileAndPersist was not called")
+			}
+		}},
+		{"already active no write", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", time.Now())
+			withSwitchActiveUUID(t, "uuid-personal") // personal is active
+
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest("--to", "personal")
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on personal@example.com")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called")
+			}
+		}},
+		{"unknown target errors", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", time.Now())
+			withSwitchActiveUUID(t, "uuid-work")
+
+			r := runSwitchTest("--to", "nobody@example.com")
+			wantExit(t, r, 2)
+			wantErrOut(t, r, `no stored account matches "nobody@example.com"`)
+		}},
+		{"multiple matches disambiguate error", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			now := time.Now()
+			// Both emails contain "example" → multiple matches.
+			seedAccount(t, ms, "uuid-a", "a@example.com", "default_claude_max_5x", now)
+			seedAccount(t, ms, "uuid-b", "b@example.com", "default_claude_max_20x", now)
+			withSwitchActiveUUID(t, "uuid-a")
+
+			r := runSwitchTest("--to", "example")
+			wantExit(t, r, 2)
+			wantErrOut(t, r, `multiple stored accounts match "example", disambiguate by uuid`)
+		}},
+		{"write error no reconcile", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+
+			withSwitchActiveUUID(t, "uuid-work")
+			stub := &stubSwitchClient{}
+			withSwitchClient(t, stub)
+			_, writeErrPtr := withWriteBlob(t)
+			*writeErrPtr = errors.New("keychain locked")
+
+			r := runSwitchTest("--to", "personal")
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: write to live credential failed: keychain locked")
+			// ReconcileAndPersist must NOT have been called (store must be unchanged).
+			if stub.reconcileCalled {
+				t.Error("ReconcileAndPersist must not be called when write fails")
+			}
+		}},
+		{"store open failure errors", func(t *testing.T) {
+			old := openAccountStore
+			openAccountStore = func(_ io.Writer) (accounts.Store, error) {
+				return nil, errors.New("disk unavailable")
+			}
+			t.Cleanup(func() { openAccountStore = old })
+
+			r := runSwitchTest("--to", "anyone")
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: could not open account store: disk unavailable")
+		}},
+		{"store list failure errors", func(t *testing.T) {
+			old := openAccountStore
+			openAccountStore = func(_ io.Writer) (accounts.Store, error) {
+				return &failListStore{listErr: errors.New("disk I/O error")}, nil
+			}
+			t.Cleanup(func() { openAccountStore = old })
+			withCodexMemoryStore(t) // empty Codex store for determinism
+
+			r := runSwitchTest("--to", "anyone")
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: could not list accounts: disk I/O error")
+		}},
 	}
-	if !strings.Contains(r.stdout, "switched to personal@example.com (uuid uuid-personal)") {
-		t.Errorf("unexpected stdout: %q", r.stdout)
-	}
-	if !strings.Contains(r.stdout, "was work@example.com") {
-		t.Errorf("missing 'was' part: %q", r.stdout)
-	}
-
-	// Written blob must match personal account's RawBlob.
-	personal := getAccountFromStore(t, ms, "uuid-personal")
-	if !bytes.Equal(*written, []byte(personal.RawBlob)) {
-		t.Errorf("written blob mismatch: got %q, want %q", *written, personal.RawBlob)
-	}
-
-	// ReconcileAndPersist must be called post-write.
-	if !stub.reconcileCalled {
-		t.Error("ReconcileAndPersist was not called after successful write")
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
-// Case 2: --to <uuid-prefix-8-chars> happy path (UUID-prefix branch).
-func TestSwitch_ToUUIDPrefixHappyPath(t *testing.T) {
-	ms := withMemoryStore(t)
-	now := time.Now()
-	// Use hex UUIDs so the prefix triggers the uuidish branch.
-	seedAccount(t, ms, "bbbb6666-7777-8888-9999-000000000000", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-	seedAccount(t, ms, "aaaa1111-2222-3333-4444-555555555555", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+// ---- Auto-pick switch tests ----
 
-	withSwitchActiveUUID(t, "bbbb6666-7777-8888-9999-000000000000")
-	stub := &stubSwitchClient{}
-	withSwitchClient(t, stub)
-	written, _ := withWriteBlob(t)
+func TestSwitchAutoPick(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"zero stored both empty", func(t *testing.T) {
+			withMemoryStore(t)      // empty Claude store
+			withCodexMemoryStore(t) // empty Codex store
+			withSwitchActiveUUID(t, "")
 
-	r := runSwitchTest("--to", "aaaa1111") // UUID-prefix (8 hex chars)
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stdout, "aaaa1111-2222-3333-4444-555555555555") {
-		t.Errorf("UUID not in output: %q", r.stdout)
-	}
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
+		}},
+		{"higher headroom wins", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t) // isolate from any real Codex store on dev machines
+			now := time.Now()
+			seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 
-	personal := getAccountFromStore(t, ms, "aaaa1111-2222-3333-4444-555555555555")
-	if !bytes.Equal(*written, []byte(personal.RawBlob)) {
-		t.Errorf("written blob mismatch")
-	}
-	if !stub.reconcileCalled {
-		t.Error("ReconcileAndPersist was not called")
-	}
-}
+			withSwitchActiveUUID(t, "uuid-work")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "personal@example.com", UUID: "uuid-personal", Limits: makeLimits(80)},
+				},
+			}
+			withSwitchClient(t, stub)
+			// Active (work) has 20% remaining → personal wins.
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimits(20), nil
+			})
+			written, _ := withWriteBlob(t)
 
-// Case 3: auto-pick with both stores empty → bulk sees no eligible providers.
-func TestSwitch_AutoPickZeroStored(t *testing.T) {
-	withMemoryStore(t)      // empty Claude store
-	withCodexMemoryStore(t) // empty Codex store
-	withSwitchActiveUUID(t, "")
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to personal@example.com")
+			wantOut(t, r, "was work@example.com")
+			personal := getAccountFromStore(t, ms, "uuid-personal")
+			if !bytes.Equal(*written, []byte(personal.RawBlob)) {
+				t.Errorf("written blob mismatch")
+			}
+		}},
+		{"active already best no write", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
 
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-		t.Errorf("missing expected message: %q", r.stderr)
-	}
-}
+			withSwitchActiveUUID(t, "uuid-personal")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					// work is non-active, only 20% remaining
+					{Email: "work@example.com", UUID: "uuid-work", Limits: makeLimits(20)},
+				},
+			}
+			withSwitchClient(t, stub)
+			// Active (personal) has 80% remaining → already best.
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimits(80), nil
+			})
+			written, _ := withWriteBlob(t)
 
-// Case 4: --to <unknown> → no match.
-func TestSwitch_ToUnknown(t *testing.T) {
-	ms := withMemoryStore(t)
-	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", time.Now())
-	withSwitchActiveUUID(t, "uuid-work")
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on best account (personal@example.com)")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called when active is already best")
+			}
+		}},
+		{"tiebreaker most recent wins", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			// accountA: 82% remaining, last seen 2 hours ago (floor(82/5)=16)
+			// accountB: 80% remaining, last seen 1 hour ago  (floor(80/5)=16)
+			// Same bucket → tiebreak by LastSeenAt → accountB wins (more recent).
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
+			seedAccount(t, ms, "uuid-a", "accounta@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "uuid-b", "accountb@example.com", "default_claude_max_20x", now.Add(-1*time.Hour))
 
-	r := runSwitchTest("--to", "nobody@example.com")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, `no stored account matches "nobody@example.com"`) {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-}
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "accounta@example.com", UUID: "uuid-a", Limits: makeLimits(82)},
+					{Email: "accountb@example.com", UUID: "uuid-b", Limits: makeLimits(80)},
+				},
+			}
+			withSwitchClient(t, stub)
+			// Active has 50% remaining (bucket 10), below both candidates (bucket 16).
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimits(50), nil
+			})
+			written, _ := withWriteBlob(t)
 
-// Case 5: --to <email> when target is already active → "already on <email>", no write.
-func TestSwitch_ToAlreadyActive(t *testing.T) {
-	ms := withMemoryStore(t)
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", time.Now())
-	withSwitchActiveUUID(t, "uuid-personal") // personal is active
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			// accountB should win (same bucket as A, but more recent LastSeenAt).
+			wantOut(t, r, "accountb@example.com")
+			accountB := getAccountFromStore(t, ms, "uuid-b")
+			if !bytes.Equal(*written, []byte(accountB.RawBlob)) {
+				t.Errorf("written blob does not match accountB's RawBlob")
+			}
+		}},
+		{"one failing excluded other wins", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-good", "good@example.com", "default_claude_max_20x", now.Add(-30*time.Minute))
+			// "bad" is excluded — FetchForSwitch already warned; stub does not return it.
 
-	written, _ := withWriteBlob(t)
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					// Only good@example.com survived; bad@example.com was excluded.
+					{Email: "good@example.com", UUID: "uuid-good", Limits: makeLimits(70)},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimits(20), nil // active at 20% → good at 70% wins
+			})
+			written, _ := withWriteBlob(t)
 
-	r := runSwitchTest("--to", "personal")
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d", r.code)
-	}
-	if !strings.Contains(r.stdout, "already on personal@example.com") {
-		t.Errorf("wrong stdout: %q", r.stdout)
-	}
-	if *written != nil {
-		t.Error("writeClaudeLiveBlob should not have been called")
-	}
-}
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "good@example.com")
+			good := getAccountFromStore(t, ms, "uuid-good")
+			if !bytes.Equal(*written, []byte(good.RawBlob)) {
+				t.Errorf("written blob mismatch")
+			}
+		}},
+		{"all failing exits 2", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
 
-// Case 6: auto-pick, personal 80% remaining, work 20% (work is active) → picks personal.
-func TestSwitch_AutoPickHigherHeadroom(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t) // isolate from any real Codex store on dev machines
-	now := time.Now()
-	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: nil, // all excluded
+			}
+			withSwitchClient(t, stub)
+			written, _ := withWriteBlob(t)
 
-	withSwitchActiveUUID(t, "uuid-work")
-	stub := &stubSwitchClient{
-		fetchResults: []providers.AccountResult{
-			{Email: "personal@example.com", UUID: "uuid-personal", Limits: makeLimits(80)},
-		},
-	}
-	withSwitchClient(t, stub)
-	// Active (work) has 20% remaining → personal wins.
-	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
-		return makeLimits(20), nil
-	})
-	written, _ := withWriteBlob(t)
+			r := runSwitchTest()
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "auto-pick failed: no accounts produced usable usage data")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called")
+			}
+		}},
+		{"fetch error exits 2", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
 
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stdout, "switched to personal@example.com") {
-		t.Errorf("unexpected stdout: %q", r.stdout)
-	}
-	if !strings.Contains(r.stdout, "was work@example.com") {
-		t.Errorf("missing 'was' part: %q", r.stdout)
-	}
-	personal := getAccountFromStore(t, ms, "uuid-personal")
-	if !bytes.Equal(*written, []byte(personal.RawBlob)) {
-		t.Errorf("written blob mismatch")
-	}
-}
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchErr: errors.New("network timeout"),
+			}
+			withSwitchClient(t, stub)
+			written, _ := withWriteBlob(t)
 
-// Case 7: auto-pick with active already best → exit 0, "already on best account (<email>)".
-func TestSwitch_AutoPickActiveAlreadyBest(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
-	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
+			r := runSwitchTest()
+			wantExit(t, r, 2)
+			wantErrOut(t, r, "aistat: claude: auto-pick usage fetch failed: network timeout")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called")
+			}
+		}},
+		{"only one account no eligible providers", func(t *testing.T) {
+			ms := withMemoryStore(t)
+			seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", time.Now())
+			withCodexMemoryStore(t) // empty Codex store
+			withSwitchActiveUUID(t, "uuid-personal")
 
-	withSwitchActiveUUID(t, "uuid-personal")
-	stub := &stubSwitchClient{
-		fetchResults: []providers.AccountResult{
-			// work is non-active, only 20% remaining
-			{Email: "work@example.com", UUID: "uuid-work", Limits: makeLimits(20)},
-		},
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantErrOut(t, r, "no providers have multiple stored accounts")
+		}},
 	}
-	withSwitchClient(t, stub)
-	// Active (personal) has 80% remaining → already best.
-	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
-		return makeLimits(80), nil
-	})
-	written, _ := withWriteBlob(t)
-
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stdout, "already on best account (personal@example.com)") {
-		t.Errorf("wrong stdout: %q", r.stdout)
-	}
-	if *written != nil {
-		t.Error("writeClaudeLiveBlob should not have been called when active is already best")
-	}
-}
-
-// Case 8: auto-pick tiebreaker — two non-active accounts in the same 5% bucket;
-// the one with the more recent LastSeenAt wins.
-func TestSwitch_AutoPickTiebreaker(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t)
-	now := time.Now()
-	// accountA: 82% remaining, last seen 2 hours ago (floor(82/5)=16)
-	// accountB: 80% remaining, last seen 1 hour ago  (floor(80/5)=16)
-	// Same bucket → tiebreak by LastSeenAt → accountB wins (more recent).
-	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
-	seedAccount(t, ms, "uuid-a", "accounta@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-	seedAccount(t, ms, "uuid-b", "accountb@example.com", "default_claude_max_20x", now.Add(-1*time.Hour))
-
-	withSwitchActiveUUID(t, "uuid-active")
-	stub := &stubSwitchClient{
-		fetchResults: []providers.AccountResult{
-			{Email: "accounta@example.com", UUID: "uuid-a", Limits: makeLimits(82)},
-			{Email: "accountb@example.com", UUID: "uuid-b", Limits: makeLimits(80)},
-		},
-	}
-	withSwitchClient(t, stub)
-	// Active has 50% remaining (bucket 10), below both candidates (bucket 16).
-	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
-		return makeLimits(50), nil
-	})
-	written, _ := withWriteBlob(t)
-
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	// accountB should win (same bucket as A, but more recent LastSeenAt).
-	if !strings.Contains(r.stdout, "accountb@example.com") {
-		t.Errorf("expected accountB to win, got stdout: %q", r.stdout)
-	}
-	accountB := getAccountFromStore(t, ms, "uuid-b")
-	if !bytes.Equal(*written, []byte(accountB.RawBlob)) {
-		t.Errorf("written blob does not match accountB's RawBlob")
-	}
-}
-
-// Case 9: auto-pick with one non-active account failing usage fetch (excluded by
-// FetchForSwitch); the other wins.
-func TestSwitch_AutoPickOneFailing(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
-	seedAccount(t, ms, "uuid-good", "good@example.com", "default_claude_max_20x", now.Add(-30*time.Minute))
-	// "bad" is excluded — FetchForSwitch already warned; stub does not return it.
-
-	withSwitchActiveUUID(t, "uuid-active")
-	stub := &stubSwitchClient{
-		fetchResults: []providers.AccountResult{
-			// Only good@example.com survived; bad@example.com was excluded.
-			{Email: "good@example.com", UUID: "uuid-good", Limits: makeLimits(70)},
-		},
-	}
-	withSwitchClient(t, stub)
-	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
-		return makeLimits(20), nil // active at 20% → good at 70% wins
-	})
-	written, _ := withWriteBlob(t)
-
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stdout, "good@example.com") {
-		t.Errorf("expected good to win, got stdout: %q", r.stdout)
-	}
-	good := getAccountFromStore(t, ms, "uuid-good")
-	if !bytes.Equal(*written, []byte(good.RawBlob)) {
-		t.Errorf("written blob mismatch")
-	}
-}
-
-// Case 10: auto-pick with ALL non-active accounts failing fetch → exit 2.
-func TestSwitch_AutoPickAllFailing(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
-	seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-
-	withSwitchActiveUUID(t, "uuid-active")
-	stub := &stubSwitchClient{
-		fetchResults: nil, // all excluded
-	}
-	withSwitchClient(t, stub)
-	written, _ := withWriteBlob(t)
-
-	r := runSwitchTest()
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "auto-pick failed: no accounts produced usable usage data") {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-	if *written != nil {
-		t.Error("writeClaudeLiveBlob should not have been called")
-	}
-}
-
-// Case 10b: FetchForSwitch returns an error → exit 2 with usage-fetch error message.
-func TestSwitch_AutoPickFetchError(t *testing.T) {
-	ms := withMemoryStore(t)
-	withCodexMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
-	seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-
-	withSwitchActiveUUID(t, "uuid-active")
-	stub := &stubSwitchClient{
-		fetchErr: errors.New("network timeout"),
-	}
-	withSwitchClient(t, stub)
-	written, _ := withWriteBlob(t)
-
-	r := runSwitchTest()
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "aistat: claude: auto-pick usage fetch failed: network timeout") {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-	if *written != nil {
-		t.Error("writeClaudeLiveBlob should not have been called")
-	}
-}
-
-// Case 11: Claude has one account, Codex empty → bulk sees no eligible providers.
-func TestSwitch_OnlyOneAccountActive(t *testing.T) {
-	ms := withMemoryStore(t)
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", time.Now())
-	withCodexMemoryStore(t) // empty Codex store
-	withSwitchActiveUUID(t, "uuid-personal")
-
-	r := runSwitchTest()
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
-		t.Errorf("missing expected message: %q", r.stderr)
-	}
-}
-
-// Case 12: writeClaudeLiveBlob returns error → exit 2; store NOT updated (no reconcile).
-func TestSwitch_WriteError(t *testing.T) {
-	ms := withMemoryStore(t)
-	now := time.Now()
-	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
-	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
-
-	withSwitchActiveUUID(t, "uuid-work")
-	stub := &stubSwitchClient{}
-	withSwitchClient(t, stub)
-	_, writeErrPtr := withWriteBlob(t)
-	*writeErrPtr = errors.New("keychain locked")
-
-	r := runSwitchTest("--to", "personal")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "aistat: claude: write to live credential failed: keychain locked") {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-	// ReconcileAndPersist must NOT have been called (store must be unchanged).
-	if stub.reconcileCalled {
-		t.Error("ReconcileAndPersist must not be called when write fails")
-	}
-}
-
-// Extra: store-open failure → exit 2 with the documented message.
-func TestSwitch_StoreOpenFailure(t *testing.T) {
-	old := openAccountStore
-	openAccountStore = func(_ io.Writer) (accounts.Store, error) {
-		return nil, errors.New("disk unavailable")
-	}
-	t.Cleanup(func() { openAccountStore = old })
-
-	r := runSwitchTest("--to", "anyone")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "aistat: claude: could not open account store: disk unavailable") {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-}
-
-// Extra: multiple matches for --to → disambiguate error.
-func TestSwitch_ToMultipleMatches(t *testing.T) {
-	ms := withMemoryStore(t)
-	now := time.Now()
-	// Both emails contain "example" → multiple matches.
-	seedAccount(t, ms, "uuid-a", "a@example.com", "default_claude_max_5x", now)
-	seedAccount(t, ms, "uuid-b", "b@example.com", "default_claude_max_20x", now)
-	withSwitchActiveUUID(t, "uuid-a")
-
-	r := runSwitchTest("--to", "example")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, `multiple stored accounts match "example", disambiguate by uuid`) {
-		t.Errorf("wrong error: %q", r.stderr)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }
 
@@ -525,28 +464,7 @@ func (f *failListStore) List(_ context.Context) ([]accounts.Account, error) {
 	return nil, f.listErr
 }
 func (f *failListStore) Upsert(_ context.Context, _ accounts.Account) error { return nil }
-func (f *failListStore) Delete(_ context.Context, _ string) error            { return nil }
-
-// Extra: store.List failure after successful open routes through runSwitchInferProvider
-// (because --to is given without a provider). The list error is collected and emitted
-// with the "could not list accounts" format. The Codex store opens empty (no match),
-// so the overall result is no match → exit 2.
-func TestSwitch_StoreListFailure(t *testing.T) {
-	old := openAccountStore
-	openAccountStore = func(_ io.Writer) (accounts.Store, error) {
-		return &failListStore{listErr: errors.New("disk I/O error")}, nil
-	}
-	t.Cleanup(func() { openAccountStore = old })
-	withCodexMemoryStore(t) // empty Codex store for determinism
-
-	r := runSwitchTest("--to", "anyone")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
-	}
-	if !strings.Contains(r.stderr, "aistat: claude: could not list accounts: disk I/O error") {
-		t.Errorf("wrong error: %q", r.stderr)
-	}
-}
+func (f *failListStore) Delete(_ context.Context, _ string) error           { return nil }
 
 // ---- PostSwitchVerify tests (all use Codex scaffold per B4#2) ----
 
@@ -567,78 +485,62 @@ func scaffoldCodexSwitch(t *testing.T) *stubCodexSwitchClient {
 	return stub
 }
 
-// TestSwitch_PostSwitchVerifyAuthDeniedWarns verifies that a PostSwitchVerify
-// returning ErrAuthDenied causes a warning on stderr but exit 0.
-func TestSwitch_PostSwitchVerifyAuthDeniedWarns(t *testing.T) {
-	stub := scaffoldCodexSwitch(t)
-	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
-		return fmt.Errorf("alice@example.com: tokens revoked by upstream...: %w", providers.ErrAuthDenied)
-	}
+func TestSwitchPostSwitchVerify(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"auth denied warns exit 0", func(t *testing.T) {
+			stub := scaffoldCodexSwitch(t)
+			stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+				return fmt.Errorf("alice@example.com: tokens revoked by upstream...: %w", providers.ErrAuthDenied)
+			}
 
-	r := runSwitchTest("codex", "--to", "alice")
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
-	}
-	if !strings.Contains(r.stdout, "switched to") {
-		t.Errorf("expected 'switched to' in stdout: %q", r.stdout)
-	}
-	wantSubstr := "aistat: codex: switched-to account's tokens are not usable: alice@example.com:"
-	if !strings.Contains(r.stderr, wantSubstr) {
-		t.Errorf("expected %q in stderr: %q", wantSubstr, r.stderr)
-	}
-	if !strings.Contains(r.stderr, "tokens revoked") {
-		t.Errorf("expected 'tokens revoked' in stderr: %q", r.stderr)
-	}
-	if strings.Count(r.stderr, "aistat: codex:") != 1 {
-		t.Errorf("expected exactly one 'aistat: codex:' in stderr, got %d: %q",
-			strings.Count(r.stderr, "aistat: codex:"), r.stderr)
-	}
-}
+			r := runSwitchTest("codex", "--to", "alice")
+			wantExit(t, r, 0)
+			wantOut(t, r, "switched to")
+			wantErrOut(t, r, "aistat: codex: switched-to account's tokens are not usable: alice@example.com:")
+			wantErrOut(t, r, "tokens revoked")
+			if strings.Count(r.stderr, "aistat: codex:") != 1 {
+				t.Errorf("expected exactly one 'aistat: codex:' in stderr, got %d: %q",
+					strings.Count(r.stderr, "aistat: codex:"), r.stderr)
+			}
+		}},
+		{"transient error silenced", func(t *testing.T) {
+			stub := scaffoldCodexSwitch(t)
+			stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+				return providers.ErrTransient
+			}
 
-// TestSwitch_PostSwitchVerifyTransientSilenced verifies that a transient error
-// from PostSwitchVerify does not produce a warning.
-func TestSwitch_PostSwitchVerifyTransientSilenced(t *testing.T) {
-	stub := scaffoldCodexSwitch(t)
-	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
-		return providers.ErrTransient
-	}
+			r := runSwitchTest("codex", "--to", "alice")
+			wantExit(t, r, 0)
+			if strings.Contains(r.stderr, "tokens are not usable") {
+				t.Errorf("transient error should be silenced; stderr: %q", r.stderr)
+			}
+		}},
+		{"nil error no warning", func(t *testing.T) {
+			scaffoldCodexSwitch(t) // postSwitchVerifyFn unset → returns nil
 
-	r := runSwitchTest("codex", "--to", "alice")
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d", r.code)
-	}
-	if strings.Contains(r.stderr, "tokens are not usable") {
-		t.Errorf("transient error should be silenced; stderr: %q", r.stderr)
-	}
-}
+			r := runSwitchTest("codex", "--to", "alice")
+			wantExit(t, r, 0)
+			if strings.Contains(r.stderr, "tokens are not usable") {
+				t.Errorf("nil verify should produce no warning; stderr: %q", r.stderr)
+			}
+		}},
+		{"non-wrapping error silenced", func(t *testing.T) {
+			stub := scaffoldCodexSwitch(t)
+			stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+				return errors.New("plain error without ErrAuthDenied wrap")
+			}
 
-// TestSwitch_PostSwitchVerifyNilNoWarn verifies that a nil error from PostSwitchVerify
-// produces no warning.
-func TestSwitch_PostSwitchVerifyNilNoWarn(t *testing.T) {
-	scaffoldCodexSwitch(t) // postSwitchVerifyFn unset → returns nil
-
-	r := runSwitchTest("codex", "--to", "alice")
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d", r.code)
+			r := runSwitchTest("codex", "--to", "alice")
+			wantExit(t, r, 0)
+			if strings.Contains(r.stderr, "tokens are not usable") {
+				t.Errorf("non-wrapping error should be silenced; stderr: %q", r.stderr)
+			}
+		}},
 	}
-	if strings.Contains(r.stderr, "tokens are not usable") {
-		t.Errorf("nil verify should produce no warning; stderr: %q", r.stderr)
-	}
-}
-
-// TestSwitch_PostSwitchVerifyNonWrappingErrorSilenced is a regression pin for A2#1/B2#2:
-// a non-%w-wrapped error is treated as non-auth-denied and silenced (not a warning).
-func TestSwitch_PostSwitchVerifyNonWrappingErrorSilenced(t *testing.T) {
-	stub := scaffoldCodexSwitch(t)
-	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
-		return errors.New("plain error without ErrAuthDenied wrap")
-	}
-
-	r := runSwitchTest("codex", "--to", "alice")
-	if r.code != 0 {
-		t.Fatalf("expected exit 0, got %d", r.code)
-	}
-	if strings.Contains(r.stderr, "tokens are not usable") {
-		t.Errorf("non-wrapping error should be silenced; stderr: %q", r.stderr)
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }

@@ -20,79 +20,61 @@ func makeRawBlob(accessToken, refreshToken string, expiresAt int64) json.RawMess
 	return json.RawMessage(b)
 }
 
-func TestStoredAccessToken_HappyPath(t *testing.T) {
-	a := accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 1000)}
-	if got := StoredAccessToken(a); got != "at-abc" {
-		t.Errorf("got %q, want %q", got, "at-abc")
+func TestStoredAccessToken(t *testing.T) {
+	tests := []struct {
+		name string
+		acct accounts.Account
+		want string
+	}{
+		{"happy path", accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 1000)}, "at-abc"},
+		{"missing claudeAiOauth", accounts.Account{RawBlob: json.RawMessage(`{"otherField":"value"}`)}, ""},
+		{"empty access token", accounts.Account{RawBlob: json.RawMessage(`{"claudeAiOauth":{"accessToken":""}}`)}, ""},
+		{"zero value account", accounts.Account{}, ""},
+		{"malformed raw blob", accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredAccessToken(tt.acct); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestStoredRefreshToken_HappyPath(t *testing.T) {
-	a := accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 1000)}
-	if got := StoredRefreshToken(a); got != "rt-xyz" {
-		t.Errorf("got %q, want %q", got, "rt-xyz")
+func TestStoredRefreshToken(t *testing.T) {
+	tests := []struct {
+		name string
+		acct accounts.Account
+		want string
+	}{
+		{"happy path", accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 1000)}, "rt-xyz"},
+		{"zero value account", accounts.Account{}, ""},
+		{"malformed raw blob", accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredRefreshToken(tt.acct); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestStoredExpiresAt_HappyPath(t *testing.T) {
-	a := accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 9876543210000)}
-	if got := StoredExpiresAt(a); got != 9876543210000 {
-		t.Errorf("got %d, want 9876543210000", got)
+func TestStoredExpiresAt(t *testing.T) {
+	tests := []struct {
+		name string
+		acct accounts.Account
+		want int64
+	}{
+		{"happy path", accounts.Account{RawBlob: makeRawBlob("at-abc", "rt-xyz", 9876543210000)}, 9876543210000},
+		{"zero value account", accounts.Account{}, 0},
+		{"malformed raw blob", accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}, 0},
 	}
-}
-
-func TestStoredAccessToken_MissingClaudeAiOauth(t *testing.T) {
-	a := accounts.Account{RawBlob: json.RawMessage(`{"otherField":"value"}`)}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("missing claudeAiOauth: got %q, want empty", got)
-	}
-}
-
-func TestStoredAccessToken_EmptyAccessToken(t *testing.T) {
-	a := accounts.Account{RawBlob: json.RawMessage(`{"claudeAiOauth":{"accessToken":""}}`)}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("empty accessToken: got %q, want empty", got)
-	}
-}
-
-func TestStoredAccessToken_ZeroValueAccount(t *testing.T) {
-	var a accounts.Account
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("zero-value account: got %q, want empty", got)
-	}
-}
-
-func TestStoredRefreshToken_ZeroValueAccount(t *testing.T) {
-	var a accounts.Account
-	if got := StoredRefreshToken(a); got != "" {
-		t.Errorf("zero-value account: got %q, want empty", got)
-	}
-}
-
-func TestStoredExpiresAt_ZeroValueAccount(t *testing.T) {
-	var a accounts.Account
-	if got := StoredExpiresAt(a); got != 0 {
-		t.Errorf("zero-value account: got %d, want 0", got)
-	}
-}
-
-func TestStoredAccessToken_MalformedRawBlob(t *testing.T) {
-	a := accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("malformed blob: got %q, want empty", got)
-	}
-}
-
-func TestStoredRefreshToken_MalformedRawBlob(t *testing.T) {
-	a := accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}
-	if got := StoredRefreshToken(a); got != "" {
-		t.Errorf("malformed blob: got %q, want empty", got)
-	}
-}
-
-func TestStoredExpiresAt_MalformedRawBlob(t *testing.T) {
-	a := accounts.Account{RawBlob: json.RawMessage(`{not valid json`)}
-	if got := StoredExpiresAt(a); got != 0 {
-		t.Errorf("malformed blob: got %d, want 0", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredExpiresAt(tt.acct); got != tt.want {
+				t.Errorf("got %d, want %d", got, tt.want)
+			}
+		})
 	}
 }

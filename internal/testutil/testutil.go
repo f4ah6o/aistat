@@ -3,11 +3,17 @@
 package testutil
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/drogers0/aistat/v2/internal/accounts"
 )
 
 // LoadFixture reads testdata/<name> relative to the calling package's testdata
@@ -39,4 +45,69 @@ func NewStubServer(t *testing.T, body []byte, status int, captureReq *http.Reque
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// CountingServer is like NewStubServer (status, body, no capture) but also
+// returns a counter incremented on every request. Closed on t.Cleanup.
+func CountingServer(t *testing.T, status int, body []byte) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var n atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n.Add(1)
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &n
+}
+
+// RejectServer returns a server that fails the test if it receives any request.
+// role names the endpoint in the failure message (e.g. "profile", "refresh"),
+// matching the contract "<role> server must not be called". Closed on t.Cleanup.
+func RejectServer(t *testing.T, role string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("%s server must not be called, but received %s %s", role, r.Method, r.URL.Path)
+		w.WriteHeader(500)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// WantNoErr fails the test (Fatalf) if err is non-nil.
+func WantNoErr(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// WantErrIs fails the test (Fatalf) unless errors.Is(err, target).
+func WantErrIs(t *testing.T, err error, target error) {
+	t.Helper()
+	if !errors.Is(err, target) {
+		t.Fatalf("error = %v, want errors.Is %v", err, target)
+	}
+}
+
+// WantErrContains fails the test (Fatalf) unless err is non-nil and its message
+// contains sub.
+func WantErrContains(t *testing.T, err error, sub string) {
+	t.Helper()
+	if err == nil || !strings.Contains(err.Error(), sub) {
+		t.Fatalf("error = %v, want contains %q", err, sub)
+	}
+}
+
+// MemStore returns an accounts.MemoryStore pre-populated with accts (in order).
+// Replaces the NewMemoryStore()+Upsert-loop idiom. Fails the test on Upsert error.
+func MemStore(t *testing.T, accts ...accounts.Account) *accounts.MemoryStore {
+	t.Helper()
+	s := accounts.NewMemoryStore()
+	for _, a := range accts {
+		if err := s.Upsert(context.Background(), a); err != nil {
+			t.Fatalf("store.Upsert: %v", err)
+		}
+	}
+	return s
 }

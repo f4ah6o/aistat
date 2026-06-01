@@ -16,67 +16,60 @@ func loadFixtureBytes(t *testing.T, name string) []byte {
 	return data
 }
 
-func TestStoredAccessToken_Present(t *testing.T) {
-	a := accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}
-	if got := StoredAccessToken(a); got != "test-access-token-abc" {
-		t.Errorf("StoredAccessToken = %q, want test-access-token-abc", got)
+func TestStoredAccessToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		account accounts.Account
+		want    string
+	}{
+		{"present", accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}, "test-access-token-abc"},
+		{"empty", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":""}}`)}, ""},
+		{"malformed json", accounts.Account{RawBlob: []byte(`{ not json }`)}, ""},
+		{"nil raw blob", accounts.Account{RawBlob: nil}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredAccessToken(tt.account); got != tt.want {
+				t.Errorf("StoredAccessToken = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestStoredAccessToken_Empty(t *testing.T) {
-	a := accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":""}}`)}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("StoredAccessToken = %q, want empty", got)
+func TestStoredRefreshToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		account accounts.Account
+		want    string
+	}{
+		{"present", accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}, "test-refresh-token-xyz"},
+		{"absent", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok"}}`)}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredRefreshToken(tt.account); got != tt.want {
+				t.Errorf("StoredRefreshToken = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestStoredAccessToken_MalformedJSON(t *testing.T) {
-	a := accounts.Account{RawBlob: []byte(`{ not json }`)}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("StoredAccessToken = %q, want empty for malformed JSON", got)
+func TestStoredExpiresAt(t *testing.T) {
+	tests := []struct {
+		name    string
+		account accounts.Account
+		want    int64
+	}{
+		// The fixture's id_token has exp=9999999999; ExpiresAt = exp*1000.
+		{"present", accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}, 9999999999000},
+		{"no id_token", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","refresh_token":"ref"}}`)}, 0},
+		{"malformed id_token", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","id_token":"bad"}}`)}, 0},
 	}
-}
-
-func TestStoredAccessToken_EmptyRawBlob(t *testing.T) {
-	a := accounts.Account{RawBlob: nil}
-	if got := StoredAccessToken(a); got != "" {
-		t.Errorf("StoredAccessToken = %q, want empty for nil RawBlob", got)
-	}
-}
-
-func TestStoredRefreshToken_Present(t *testing.T) {
-	a := accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}
-	if got := StoredRefreshToken(a); got != "test-refresh-token-xyz" {
-		t.Errorf("StoredRefreshToken = %q, want test-refresh-token-xyz", got)
-	}
-}
-
-func TestStoredRefreshToken_Absent(t *testing.T) {
-	a := accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok"}}`)}
-	if got := StoredRefreshToken(a); got != "" {
-		t.Errorf("StoredRefreshToken = %q, want empty when absent", got)
-	}
-}
-
-func TestStoredExpiresAt_Present(t *testing.T) {
-	// The fixture's id_token has exp=9999999999; ExpiresAt = exp*1000.
-	a := accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}
-	want := int64(9999999999000)
-	if got := StoredExpiresAt(a); got != want {
-		t.Errorf("StoredExpiresAt = %d, want %d", got, want)
-	}
-}
-
-func TestStoredExpiresAt_NoIDToken(t *testing.T) {
-	a := accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","refresh_token":"ref"}}`)}
-	if got := StoredExpiresAt(a); got != 0 {
-		t.Errorf("StoredExpiresAt = %d, want 0 when id_token absent", got)
-	}
-}
-
-func TestStoredExpiresAt_MalformedIDToken(t *testing.T) {
-	a := accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","id_token":"bad"}}`)}
-	if got := StoredExpiresAt(a); got != 0 {
-		t.Errorf("StoredExpiresAt = %d, want 0 for malformed id_token", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StoredExpiresAt(tt.account); got != tt.want {
+				t.Errorf("StoredExpiresAt = %d, want %d", got, tt.want)
+			}
+		})
 	}
 }
