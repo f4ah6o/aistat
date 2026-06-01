@@ -114,7 +114,7 @@ func TestCLI_FakeProviderFailureExits1(t *testing.T) {
 	// Round-6 contract: exit 1 for runtime failures, exit 2 reserved for usage
 	// / contract errors. The --fake-fail=claude knob injects a hard error in
 	// the claude provider's Fetch; the other two still succeed, so the JSON
-	// must contain claude.error AND codex.limits.
+	// must contain claude.error AND codex.accounts (per-account shape).
 	r := runCLI("--fake", "--fake-fail=claude")
 	if r.code != 1 {
 		t.Fatalf("expected exit 1 for runtime failure, got %d (stderr %q)", r.code, r.stderr)
@@ -132,7 +132,7 @@ func TestCLI_FakeProviderFailureExits1(t *testing.T) {
 		t.Errorf("claude.limits should be null on failure, got %v", claude["limits"])
 	}
 	codex, _ := provs["codex"].(map[string]any)
-	if codex["limits"] == nil {
-		t.Errorf("expected codex.limits to still be present (a failing sibling does not block successes), got %v", codex)
+	if codex["accounts"] == nil {
+		t.Errorf("expected codex.accounts to still be present (a failing sibling does not block successes), got %v", codex)
 	}
 }

@@ -1,0 +1,551 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/drogers0/aistat/v2/internal/accounts"
+	"github.com/drogers0/aistat/v2/internal/providers"
+)
+
+// withCodexMemoryStore swaps openCodexAccountStore for a MemoryStore during the test.
+func withCodexMemoryStore(t *testing.T) *accounts.MemoryStore {
+	t.Helper()
+	ms := accounts.NewMemoryStore()
+	old := openCodexAccountStore
+	openCodexAccountStore = func(_ io.Writer) (accounts.Store, error) { return ms, nil }
+	t.Cleanup(func() { openCodexAccountStore = old })
+	return ms
+}
+
+// stubCodexSwitchClient implements switchable for Codex switch tests.
+type stubCodexSwitchClient struct {
+	fetchResults       []providers.AccountResult
+	fetchErr           error
+	reconcileCalled    bool
+	postSwitchVerifyFn func(context.Context, accounts.Account) error
+}
+
+func (s *stubCodexSwitchClient) FetchForSwitch(_ context.Context) ([]providers.AccountResult, error) {
+	return s.fetchResults, s.fetchErr
+}
+
+func (s *stubCodexSwitchClient) ReconcileAndPersist(_ context.Context) error {
+	s.reconcileCalled = true
+	return nil
+}
+
+func (s *stubCodexSwitchClient) PostSwitchVerify(ctx context.Context, target accounts.Account) error {
+	if s.postSwitchVerifyFn != nil {
+		return s.postSwitchVerifyFn(ctx, target)
+	}
+	return nil
+}
+
+// withCodexSwitchClient swaps newCodexSwitchClient for the duration of the test.
+func withCodexSwitchClient(t *testing.T, stub *stubCodexSwitchClient) {
+	t.Helper()
+	old := newCodexSwitchClient
+	newCodexSwitchClient = func(_ io.Writer, _ string, _ accounts.Store) switchable { return stub }
+	t.Cleanup(func() { newCodexSwitchClient = old })
+}
+
+// withCodexWriteBlob stubs writeCodexLiveBlob, capturing the written bytes.
+func withCodexWriteBlob(t *testing.T) (written *[]byte, writeErr *error) {
+	t.Helper()
+	var blob []byte
+	var werr error
+	old := writeCodexLiveBlob
+	writeCodexLiveBlob = func(_ context.Context, raw []byte) error {
+		if werr != nil {
+			return werr
+		}
+		blob = append([]byte{}, raw...)
+		return nil
+	}
+	t.Cleanup(func() { writeCodexLiveBlob = old })
+	return &blob, &werr
+}
+
+// withCodexActiveUUID stubs switchLookupCodexActiveUUID to return a fixed UUID.
+func withCodexActiveUUID(t *testing.T, uuid string) {
+	t.Helper()
+	old := switchLookupCodexActiveUUID
+	switchLookupCodexActiveUUID = func(_ context.Context, _ []accounts.Account, _ io.Writer) (string, error) {
+		return uuid, nil
+	}
+	t.Cleanup(func() { switchLookupCodexActiveUUID = old })
+}
+
+// seedCodexAccount inserts a Codex-shaped account into ms.
+func seedCodexAccount(t *testing.T, ms *accounts.MemoryStore, uuid, email, plan string, lastSeen time.Time) {
+	t.Helper()
+	rawBlob := []byte(`{"tokens":{"access_token":"ctok-` + uuid + `","refresh_token":"crt-` + uuid + `"}}`)
+	a, err := accounts.NewAccount(rawBlob, uuid, email, email, plan, lastSeen)
+	if err != nil {
+		t.Fatalf("seedCodexAccount: %v", err)
+	}
+	if err := ms.Upsert(context.Background(), a); err != nil {
+		t.Fatalf("seedCodexAccount Upsert: %v", err)
+	}
+}
+
+// runSwitchMultiTest calls runSwitch with empty globals and captures output.
+func runSwitchMultiTest(args ...string) runResult {
+	var stdout, stderr bytes.Buffer
+	code := runSwitch(args, &stdout, &stderr, globals{})
+	return runResult{stdout.String(), stderr.String(), code}
+}
+
+// ---- Bulk switch tests ----
+
+func TestSwitch_BulkBothProviders(t *testing.T) {
+	now := time.Now()
+
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-cwork", "cwork@example.com", "plan", now.Add(-2*time.Hour))
+	seedAccount(t, claudeMS, "uuid-cpersonal", "cpersonal@example.com", "plan", now.Add(-1*time.Hour))
+	withSwitchActiveUUID(t, "uuid-cwork")
+
+	claudeStub := &stubSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "cpersonal@example.com", UUID: "uuid-cpersonal", Limits: makeLimits(80)},
+		},
+	}
+	withSwitchClient(t, claudeStub)
+	claudeWritten, _ := withWriteBlob(t)
+	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+		return makeLimits(20), nil
+	})
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-dwork", "dwork@chatgpt.com", "plan", now.Add(-2*time.Hour))
+	seedCodexAccount(t, codexMS, "uuid-dpersonal", "dpersonal@chatgpt.com", "plan", now.Add(-1*time.Hour))
+	withCodexActiveUUID(t, "uuid-dwork")
+
+	codexStub := &stubCodexSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "dpersonal@chatgpt.com", UUID: "uuid-dpersonal", Limits: makeLimits(80)},
+		},
+	}
+	withCodexSwitchClient(t, codexStub)
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest()
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "[claude]") {
+		t.Errorf("missing [claude] header; stdout: %q", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "[codex]") {
+		t.Errorf("missing [codex] header; stdout: %q", r.stdout)
+	}
+	if *claudeWritten == nil {
+		t.Error("Claude blob not written")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob not written")
+	}
+}
+
+func TestSwitch_BulkOnlyClaudeHasMultiple(t *testing.T) {
+	now := time.Now()
+
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-cw", "cw@example.com", "plan", now.Add(-2*time.Hour))
+	seedAccount(t, claudeMS, "uuid-cp", "cp@example.com", "plan", now.Add(-1*time.Hour))
+	withSwitchActiveUUID(t, "uuid-cw")
+
+	claudeStub := &stubSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "cp@example.com", UUID: "uuid-cp", Limits: makeLimits(80)},
+		},
+	}
+	withSwitchClient(t, claudeStub)
+	claudeWritten, _ := withWriteBlob(t)
+	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+		return makeLimits(20), nil
+	})
+
+	// Codex has only 1 account → not eligible.
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-donly", "only@chatgpt.com", "plan", now)
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest()
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "[claude]") {
+		t.Errorf("missing [claude] header; stdout: %q", r.stdout)
+	}
+	if strings.Contains(r.stdout, "[codex]") {
+		t.Errorf("[codex] header should not appear; stdout: %q", r.stdout)
+	}
+	if *claudeWritten == nil {
+		t.Error("Claude blob should have been written")
+	}
+	if *codexWritten != nil {
+		t.Error("Codex blob should NOT have been written")
+	}
+}
+
+func TestSwitch_BulkOnlyCodexHasMultiple(t *testing.T) {
+	now := time.Now()
+
+	// Claude has only 1 account → not eligible.
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-conly", "conly@example.com", "plan", now)
+	claudeWritten, _ := withWriteBlob(t)
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-dwork", "dwork@chatgpt.com", "plan", now.Add(-2*time.Hour))
+	seedCodexAccount(t, codexMS, "uuid-dpersonal", "dpersonal@chatgpt.com", "plan", now.Add(-1*time.Hour))
+	withCodexActiveUUID(t, "uuid-dwork")
+
+	codexStub := &stubCodexSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "dpersonal@chatgpt.com", UUID: "uuid-dpersonal", Limits: makeLimits(80)},
+		},
+	}
+	withCodexSwitchClient(t, codexStub)
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest()
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if strings.Contains(r.stdout, "[claude]") {
+		t.Errorf("[claude] header should not appear; stdout: %q", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "[codex]") {
+		t.Errorf("missing [codex] header; stdout: %q", r.stdout)
+	}
+	if *claudeWritten != nil {
+		t.Error("Claude blob should NOT have been written")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written")
+	}
+}
+
+func TestSwitch_BulkNoProviderHasMultiple(t *testing.T) {
+	now := time.Now()
+
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-conly", "conly@example.com", "plan", now)
+
+	withCodexMemoryStore(t) // empty Codex
+
+	r := runSwitchMultiTest()
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
+		t.Errorf("missing expected message; stderr: %q", r.stderr)
+	}
+}
+
+func TestSwitch_BulkSkipsEmptyStore(t *testing.T) {
+	now := time.Now()
+
+	// Claude empty.
+	withMemoryStore(t)
+	claudeWritten, _ := withWriteBlob(t)
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-dw", "dw@chatgpt.com", "plan", now.Add(-2*time.Hour))
+	seedCodexAccount(t, codexMS, "uuid-dp", "dp@chatgpt.com", "plan", now.Add(-1*time.Hour))
+	withCodexActiveUUID(t, "uuid-dw")
+
+	codexStub := &stubCodexSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "dp@chatgpt.com", UUID: "uuid-dp", Limits: makeLimits(80)},
+		},
+	}
+	withCodexSwitchClient(t, codexStub)
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest()
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "[codex]") {
+		t.Errorf("missing [codex] header; stdout: %q", r.stdout)
+	}
+	if *claudeWritten != nil {
+		t.Error("Claude blob should NOT have been written (empty store, skipped)")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written")
+	}
+}
+
+// ---- Provider-arg tests ----
+
+func TestSwitch_ProviderArgClaude(t *testing.T) {
+	now := time.Now()
+
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-cw2", "cw2@example.com", "plan", now.Add(-2*time.Hour))
+	seedAccount(t, claudeMS, "uuid-cp2", "cp2@example.com", "plan", now.Add(-1*time.Hour))
+	withSwitchActiveUUID(t, "uuid-cw2")
+
+	claudeStub := &stubSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "cp2@example.com", UUID: "uuid-cp2", Limits: makeLimits(80)},
+		},
+	}
+	withSwitchClient(t, claudeStub)
+	claudeWritten, _ := withWriteBlob(t)
+	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+		return makeLimits(20), nil
+	})
+
+	withCodexMemoryStore(t) // empty Codex — must NOT be touched
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest("claude")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if *claudeWritten == nil {
+		t.Error("Claude blob should have been written")
+	}
+	if *codexWritten != nil {
+		t.Error("Codex should NOT have been touched")
+	}
+}
+
+func TestSwitch_ProviderArgCodex(t *testing.T) {
+	now := time.Now()
+
+	withMemoryStore(t) // empty Claude — must NOT be touched
+	claudeWritten, _ := withWriteBlob(t)
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-d1", "d1@chatgpt.com", "plan", now.Add(-2*time.Hour))
+	seedCodexAccount(t, codexMS, "uuid-d2", "d2@chatgpt.com", "plan", now.Add(-1*time.Hour))
+	withCodexActiveUUID(t, "uuid-d1")
+
+	codexStub := &stubCodexSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "d2@chatgpt.com", UUID: "uuid-d2", Limits: makeLimits(80)},
+		},
+	}
+	withCodexSwitchClient(t, codexStub)
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest("codex")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if *claudeWritten != nil {
+		t.Error("Claude should NOT have been touched")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written")
+	}
+}
+
+func TestSwitch_ProviderArgUnknown(t *testing.T) {
+	withMemoryStore(t)
+	withCodexMemoryStore(t)
+
+	r := runSwitchMultiTest("bogus")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "unknown provider") {
+		t.Errorf("missing unknown provider error; stderr: %q", r.stderr)
+	}
+}
+
+func TestSwitch_ProviderArgClaude_OneAccount(t *testing.T) {
+	ms := withMemoryStore(t)
+	seedAccount(t, ms, "uuid-only", "only@example.com", "plan", time.Now())
+	withSwitchActiveUUID(t, "uuid-only")
+	withCodexMemoryStore(t)
+
+	r := runSwitchMultiTest("claude")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	want := "only one account stored; nothing to switch to (run `claude /login` to add another)"
+	if !strings.Contains(r.stderr, want) {
+		t.Errorf("missing Claude login hint; stderr: %q", r.stderr)
+	}
+}
+
+func TestSwitch_ProviderArgCodex_ZeroAccounts(t *testing.T) {
+	withMemoryStore(t)
+	withCodexMemoryStore(t) // empty Codex store
+
+	r := runSwitchMultiTest("codex")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "no accounts stored") {
+		t.Errorf("missing 'no accounts stored' message; stderr: %q", r.stderr)
+	}
+}
+
+// ---- Infer-provider tests (--to without provider) ----
+
+func TestSwitch_ToInferByID_ClaudeUnique(t *testing.T) {
+	ms := withMemoryStore(t)
+	seedAccount(t, ms, "uuid-cu", "unique@claude.com", "plan", time.Now())
+	seedAccount(t, ms, "uuid-cu2", "other@claude.com", "plan", time.Now())
+	withSwitchActiveUUID(t, "uuid-cu2")
+	withSwitchClient(t, &stubSwitchClient{})
+	claudeWritten, _ := withWriteBlob(t)
+
+	withCodexMemoryStore(t) // empty → no Codex match
+	withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest("--to", "unique")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if *claudeWritten == nil {
+		t.Error("Claude blob should have been written")
+	}
+}
+
+func TestSwitch_ToInferByID_CodexUnique(t *testing.T) {
+	withMemoryStore(t) // empty Claude → no Claude match
+	claudeWritten, _ := withWriteBlob(t)
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-du", "user@codex.com", "plan", time.Now())
+	seedCodexAccount(t, codexMS, "uuid-da", "active@codex.com", "plan", time.Now())
+	withCodexActiveUUID(t, "uuid-da")
+	withCodexSwitchClient(t, &stubCodexSwitchClient{})
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest("--to", "user@codex")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if *claudeWritten != nil {
+		t.Error("Claude should NOT have been touched")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written")
+	}
+}
+
+func TestSwitch_ToInferByID_Ambiguous(t *testing.T) {
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-cs", "shared@example.com", "plan", time.Now())
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-ds", "shared@chatgpt.com", "plan", time.Now())
+
+	r := runSwitchMultiTest("--to", "shared")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "multiple providers match") {
+		t.Errorf("missing ambiguity error; stderr: %q", r.stderr)
+	}
+}
+
+// TestSwitch_ToInferByID_SameProviderMultiMatch verifies that when multiple
+// accounts in the same provider match, the single-provider disambiguation message
+// is shown (not the cross-provider ambiguity message).
+func TestSwitch_ToInferByID_SameProviderMultiMatch(t *testing.T) {
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-ca", "shared@work.com", "plan", time.Now())
+	seedAccount(t, claudeMS, "uuid-cb", "shared@personal.com", "plan", time.Now())
+
+	withCodexMemoryStore(t) // empty → no Codex match
+
+	r := runSwitchMultiTest("--to", "shared")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "multiple stored accounts match") {
+		t.Errorf("missing single-provider disambiguation message; stderr: %q", r.stderr)
+	}
+	if strings.Contains(r.stderr, "multiple providers match") {
+		t.Errorf("should NOT show cross-provider ambiguity message; stderr: %q", r.stderr)
+	}
+}
+
+func TestSwitch_ToWithProviderArg_Codex(t *testing.T) {
+	withMemoryStore(t) // empty Claude
+	claudeWritten, _ := withWriteBlob(t)
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-dtarget", "target@codex.com", "plan", time.Now())
+	seedCodexAccount(t, codexMS, "uuid-dactive", "active@codex.com", "plan", time.Now())
+	withCodexActiveUUID(t, "uuid-dactive")
+	withCodexSwitchClient(t, &stubCodexSwitchClient{})
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest("codex", "--to", "target@codex.com")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if *claudeWritten != nil {
+		t.Error("Claude should NOT have been touched")
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written")
+	}
+}
+
+func TestSwitch_BulkPartialFailure(t *testing.T) {
+	now := time.Now()
+
+	claudeMS := withMemoryStore(t)
+	seedAccount(t, claudeMS, "uuid-cf1", "cf1@example.com", "plan", now.Add(-2*time.Hour))
+	seedAccount(t, claudeMS, "uuid-cf2", "cf2@example.com", "plan", now.Add(-1*time.Hour))
+	withSwitchActiveUUID(t, "uuid-cf1")
+	withSwitchClient(t, &stubSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "cf2@example.com", UUID: "uuid-cf2", Limits: makeLimits(80)},
+		},
+	})
+	withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+		return makeLimits(20), nil
+	})
+	_, claudeWriteErr := withWriteBlob(t)
+	*claudeWriteErr = errors.New("keychain locked")
+
+	codexMS := withCodexMemoryStore(t)
+	seedCodexAccount(t, codexMS, "uuid-ds1", "ds1@chatgpt.com", "plan", now.Add(-2*time.Hour))
+	seedCodexAccount(t, codexMS, "uuid-ds2", "ds2@chatgpt.com", "plan", now.Add(-1*time.Hour))
+	withCodexActiveUUID(t, "uuid-ds1")
+	withCodexSwitchClient(t, &stubCodexSwitchClient{
+		fetchResults: []providers.AccountResult{
+			{Email: "ds2@chatgpt.com", UUID: "uuid-ds2", Limits: makeLimits(80)},
+		},
+	})
+	codexWritten, _ := withCodexWriteBlob(t)
+
+	r := runSwitchMultiTest()
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	// D5: per-provider headers must appear in stdout even when a provider fails.
+	if !strings.Contains(r.stdout, "[claude]") {
+		t.Errorf("missing [claude] header in stdout (D5); stdout: %q", r.stdout)
+	}
+	if !strings.Contains(r.stdout, "[codex]") {
+		t.Errorf("missing [codex] header in stdout (D5); stdout: %q", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "write to live credential failed") {
+		t.Errorf("missing Claude write error; stderr: %q", r.stderr)
+	}
+	if *codexWritten == nil {
+		t.Error("Codex blob should have been written despite Claude failure")
+	}
+}

@@ -340,3 +340,112 @@ func TestText_ClaudeAccountsUnknownTier(t *testing.T) {
 		t.Fatalf("got %q want %q", buf.String(), want)
 	}
 }
+
+func TestText_CodexAccountsSingle(t *testing.T) {
+	// Codex has no rate_limit_tier; Plan="" renders without a [Plan] suffix.
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"codex": {Accounts: []providers.AccountResult{
+				{
+					Email:  "me@example.com",
+					Plan:   "",
+					Active: true,
+					Limits: map[string]providers.Limit{
+						"five_hour": mkLimit(34, 4*3600+53*60),
+					},
+				},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = Text(&buf, r, []string{"codex"})
+	want := "Codex usage\n- me@example.com (active)\n  - 5-hour: 34.0% (resets in 4h 53m)\n"
+	if buf.String() != want {
+		t.Fatalf("got %q want %q", buf.String(), want)
+	}
+}
+
+func TestText_CodexAccountsTwo(t *testing.T) {
+	// Two Codex accounts with mixed window sets, including the slot-vs-duration-
+	// safe `seven_day` + `code_review_seven_day` keys T3 introduced.
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"codex": {Accounts: []providers.AccountResult{
+				{
+					Email:  "a@work.com",
+					Active: true,
+					Limits: map[string]providers.Limit{
+						"five_hour": mkLimit(10, 3600),
+						"seven_day": mkLimit(5, 2*86400+3*3600),
+					},
+				},
+				{
+					Email:  "b@personal.com",
+					Active: false,
+					Limits: map[string]providers.Limit{
+						"seven_day":             mkLimit(80, 86400),
+						"code_review_seven_day": mkLimit(2, 4*86400+3600),
+					},
+				},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = Text(&buf, r, []string{"codex"})
+	want := "" +
+		"Codex usage\n" +
+		"- a@work.com (active)\n" +
+		"  - 5-hour: 10.0% (resets in 1h 0m)\n" +
+		"  - 7-day: 5.0% (resets in 2d 3h)\n" +
+		"- b@personal.com\n" +
+		"  - 7-day: 80.0% (resets in 1d 0h)\n" +
+		"  - Code review 7-day: 2.0% (resets in 4d 1h)\n"
+	if buf.String() != want {
+		t.Fatalf("got:\n%s\nwant:\n%s", buf.String(), want)
+	}
+}
+
+func TestText_CodexAccountsFallbackLiveRow(t *testing.T) {
+	// Fallback live row: Email = "(live Codex account)", Plan = "", UUID = "".
+	// Mirrors TestText_ClaudeAccountsFallbackLiveRow with the Codex label.
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"codex": {Accounts: []providers.AccountResult{
+				{
+					Email:  "(live Codex account)",
+					Plan:   "",
+					Active: true,
+					Limits: map[string]providers.Limit{
+						"five_hour": mkLimit(50, 1800),
+					},
+				},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = Text(&buf, r, []string{"codex"})
+	want := "Codex usage\n- (live Codex account) (active)\n  - 5-hour: 50.0% (resets in 30m)\n"
+	if buf.String() != want {
+		t.Fatalf("got %q want %q", buf.String(), want)
+	}
+}
+
+func TestText_CodexAccountsPerAccountError(t *testing.T) {
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"codex": {Accounts: []providers.AccountResult{
+				{
+					Email:  "err@example.com",
+					Active: true,
+					Error:  "usage fetch timed out",
+				},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = Text(&buf, r, []string{"codex"})
+	want := "Codex usage\n- err@example.com (active): usage fetch timed out\n"
+	if buf.String() != want {
+		t.Fatalf("got %q want %q", buf.String(), want)
+	}
+}

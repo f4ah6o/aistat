@@ -136,11 +136,11 @@ func TestReconcile_ByteMatch_StaleRefreshToken(t *testing.T) {
 		t.Error("Upserted = false, want true")
 	}
 	slot := out.Accounts[0]
-	if got := slot.RefreshToken(); got != "ref-a-new" {
-		t.Errorf("slot.RefreshToken() = %q, want %q", got, "ref-a-new")
+	if got := StoredRefreshToken(slot); got != "ref-a-new" {
+		t.Errorf("StoredRefreshToken() = %q, want %q", got, "ref-a-new")
 	}
-	if got := slot.ExpiresAt(); got != 9999 {
-		t.Errorf("slot.ExpiresAt() = %d, want 9999", got)
+	if got := StoredExpiresAt(slot); got != 9999 {
+		t.Errorf("StoredExpiresAt() = %d, want 9999", got)
 	}
 	if slot.LastSeenAt != testNow {
 		t.Errorf("slot.LastSeenAt = %v, want %v", slot.LastSeenAt, testNow)

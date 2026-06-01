@@ -1,6 +1,13 @@
 //go:build darwin || linux
 
-package claude
+// Package usagecache is a provider-neutral, per-UUID usage limit cache backed
+// by a single JSON file in $CACHE/aistat/usage/. It is used by provider
+// packages (e.g. internal/providers/claude) to reduce API round-trips.
+//
+// Callers supply a provider name; the package computes <provider>-v1.json and
+// <provider>.cache.lock under $CACHE/aistat/usage/ so each provider's files
+// are isolated without the caller needing to know the naming convention.
+package usagecache
 
 import (
 	"encoding/json"
@@ -16,20 +23,18 @@ import (
 	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
-const usageCacheTTLDefault = 90 * time.Second
+const ttlDefault = 90 * time.Second
 
-// usageCacheFilename is versioned by suffix; bumping the format means writing
-// a new filename and ignoring older ones. No in-file schema field, no
-// version-mismatch branches.
-const usageCacheFilename = "claude-v1.json"
-
-type usageCache struct {
+// Cache is a file-backed, per-UUID usage limit cache. All exported methods are
+// safe for concurrent use. The zero value is not usable; construct via New.
+type Cache struct {
+	provider    string
 	path        string
 	lockPath    string
 	ttl         time.Duration
-	now         func() time.Time // wired from Client.now in newUsageCache
+	now         func() time.Time
 	warn        func(string)
-	once        sync.Once // guards all warn calls — fires at most once per usageCache instance
+	once        sync.Once // guards all warn calls — fires at most once per Cache
 	disabled    bool
 	disabledMsg string // pre-composed warn message; empty when not disabled
 }
@@ -43,12 +48,21 @@ type cacheEntry struct {
 	Limits    map[string]providers.Limit `json:"limits"`
 }
 
-// newUsageCache resolves $CACHE/aistat/usage/claude-v1.json, creates the
-// parent directory (mode 0700) if absent. nowFn defaults to time.Now if nil;
-// warnFn defaults to a silent no-op if nil. On any setup failure returns a
-// no-op cache (disabled=true); the warn fires at most once, on the first
-// Get or Put call.
-func newUsageCache(nowFn func() time.Time, warnFn func(string)) *usageCache {
+// New constructs a Cache for the given provider. The data file is stored at
+// $CACHE/aistat/usage/<provider>-v1.json and locked via
+// $CACHE/aistat/usage/<provider>.cache.lock. The parent directory is created
+// with mode 0700 if absent.
+//
+// provider must consist only of lowercase ASCII letters, digits, underscore,
+// or dash. On invalid input, returns a disabled cache that warns once on first
+// use.
+//
+// nowFn defaults to time.Now if nil. warnFn defaults to a silent no-op if nil.
+// AISTAT_USAGE_CACHE_TTL overrides the default 90s TTL if parseable as a duration.
+//
+// On any setup failure returns a no-op cache (disabled=true); the warn fires
+// at most once, on the first Get or Put call.
+func New(provider string, nowFn func() time.Time, warnFn func(string)) *Cache {
 	if nowFn == nil {
 		nowFn = time.Now
 	}
@@ -56,34 +70,60 @@ func newUsageCache(nowFn func() time.Time, warnFn func(string)) *usageCache {
 		warnFn = func(string) {}
 	}
 
-	ttl := usageCacheTTLDefault
+	ttl := ttlDefault
 	if s := os.Getenv("AISTAT_USAGE_CACHE_TTL"); s != "" {
 		if d, err := time.ParseDuration(s); err == nil {
 			ttl = d
 		}
 	}
 
+	if !isValidProvider(provider) {
+		return disabledCache("", nowFn, warnFn, ttl, fmt.Sprintf("invalid provider %q", provider))
+	}
+
 	cacheBase, err := os.UserCacheDir()
 	if err != nil {
-		return disabledCache(nowFn, warnFn, ttl, fmt.Sprintf("cannot resolve cache dir: %v", err))
+		return disabledCache(provider, nowFn, warnFn, ttl, fmt.Sprintf("cannot resolve cache dir: %v", err))
 	}
 	dir := filepath.Join(cacheBase, "aistat", "usage")
 	if err := os.MkdirAll(dir, 0700); err != nil {
-		return disabledCache(nowFn, warnFn, ttl, fmt.Sprintf("cannot create cache dir %s: %v", dir, err))
+		return disabledCache(provider, nowFn, warnFn, ttl, fmt.Sprintf("cannot create cache dir %s: %v", dir, err))
 	}
-	return &usageCache{
-		path:     filepath.Join(dir, usageCacheFilename),
-		lockPath: filepath.Join(dir, "claude.cache.lock"),
+	return &Cache{
+		provider: provider,
+		path:     filepath.Join(dir, provider+"-v1.json"),
+		lockPath: filepath.Join(dir, provider+".cache.lock"),
 		ttl:      ttl,
 		now:      nowFn,
 		warn:     warnFn,
 	}
 }
 
-func disabledCache(nowFn func() time.Time, warnFn func(string), ttl time.Duration, reason string) *usageCache {
-	return &usageCache{
+// isValidProvider reports whether s is a valid provider string: non-empty,
+// consisting only of lowercase ASCII letters, digits, underscore, or dash.
+func isValidProvider(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, b := range []byte(s) {
+		if !((b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func disabledCache(provider string, nowFn func() time.Time, warnFn func(string), ttl time.Duration, reason string) *Cache {
+	var msg string
+	if provider != "" {
+		msg = "aistat: " + provider + ": usage cache disabled (" + reason + ")"
+	} else {
+		msg = "aistat: usage cache disabled (" + reason + ")"
+	}
+	return &Cache{
+		provider:    provider,
 		disabled:    true,
-		disabledMsg: "aistat: claude: usage cache disabled (" + reason + ")",
+		disabledMsg: msg,
 		ttl:         ttl,
 		now:         nowFn,
 		warn:        warnFn,
@@ -97,7 +137,7 @@ func disabledCache(nowFn func() time.Time, warnFn func(string), ttl time.Duratio
 // open fd would travel with the orphaned inode after rename, letting a second
 // writer race ahead with stale state. The sentinel never gets renamed so the
 // lock anchors a stable serialization point.
-func (c *usageCache) withLock(mode int, fn func() error) error {
+func (c *Cache) withLock(mode int, fn func() error) error {
 	f, err := os.OpenFile(c.lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return fmt.Errorf("usage cache: open lock file: %w", err)
@@ -112,7 +152,7 @@ func (c *usageCache) withLock(mode int, fn func() error) error {
 
 // atomicWrite marshals cf to JSON and atomically replaces c.path via a
 // temp-file-in-same-dir + rename, preserving mode 0600.
-func (c *usageCache) atomicWrite(cf cacheFile) error {
+func (c *Cache) atomicWrite(cf cacheFile) error {
 	data, err := json.Marshal(cf)
 	if err != nil {
 		return err
@@ -140,13 +180,13 @@ func (c *usageCache) atomicWrite(cf cacheFile) error {
 	return nil
 }
 
-// getWithAge returns the limits, the age of the cache entry (now - FetchedAt),
+// GetWithAge returns the limits, the age of the cache entry (now - FetchedAt),
 // and hit status. Returns (nil, 0, false) on miss, expired entry, missing
 // file, parse error, disabled state, or any other read failure. Parse errors
 // fire the warn line once; subsequent reads stay quiet. The cache stores
 // absolute ResetsAt in each Limit; ResetAfterSeconds is NOT recomputed here —
 // that is the caller's responsibility.
-func (c *usageCache) getWithAge(uuid string) (map[string]providers.Limit, time.Duration, bool) {
+func (c *Cache) GetWithAge(uuid string) (map[string]providers.Limit, time.Duration, bool) {
 	if c.disabled {
 		c.once.Do(func() { c.warn(c.disabledMsg) })
 		return nil, 0, false
@@ -167,7 +207,7 @@ func (c *usageCache) getWithAge(uuid string) (map[string]providers.Limit, time.D
 		var cf cacheFile
 		if err := json.Unmarshal(data, &cf); err != nil {
 			c.once.Do(func() {
-				c.warn(fmt.Sprintf("aistat: claude: usage cache: corrupt file, ignoring: %v", err))
+				c.warn(fmt.Sprintf("aistat: %s: usage cache: corrupt file, ignoring: %v", c.provider, err))
 			})
 			return nil // treat as miss
 		}
@@ -188,7 +228,7 @@ func (c *usageCache) getWithAge(uuid string) (map[string]providers.Limit, time.D
 
 	if err != nil {
 		c.once.Do(func() {
-			c.warn(fmt.Sprintf("aistat: claude: usage cache: read error: %v", err))
+			c.warn(fmt.Sprintf("aistat: %s: usage cache: read error: %v", c.provider, err))
 		})
 		return nil, 0, false
 	}
@@ -196,17 +236,17 @@ func (c *usageCache) getWithAge(uuid string) (map[string]providers.Limit, time.D
 }
 
 // Get returns (limits, true) if a non-expired entry exists for uuid.
-// Returns (nil, false) on miss, expired, or any error. See getWithAge for
+// Returns (nil, false) on miss, expired, or any error. See GetWithAge for
 // the full contract.
-func (c *usageCache) Get(uuid string) (map[string]providers.Limit, bool) {
-	m, _, ok := c.getWithAge(uuid)
+func (c *Cache) Get(uuid string) (map[string]providers.Limit, bool) {
+	m, _, ok := c.GetWithAge(uuid)
 	return m, ok
 }
 
 // Put writes limits under uuid, replacing any existing entry. Best effort:
 // errors are swallowed (warn fires at most once on the first write failure).
 // Writes via tmp + rename under LOCK_EX on the sentinel lock file.
-func (c *usageCache) Put(uuid string, limits map[string]providers.Limit) {
+func (c *Cache) Put(uuid string, limits map[string]providers.Limit) {
 	if c.disabled {
 		c.once.Do(func() { c.warn(c.disabledMsg) })
 		return
@@ -237,7 +277,7 @@ func (c *usageCache) Put(uuid string, limits map[string]providers.Limit) {
 
 	if err != nil {
 		c.once.Do(func() {
-			c.warn(fmt.Sprintf("aistat: claude: usage cache: write failed: %v", err))
+			c.warn(fmt.Sprintf("aistat: %s: usage cache: write failed: %v", c.provider, err))
 		})
 	}
 }

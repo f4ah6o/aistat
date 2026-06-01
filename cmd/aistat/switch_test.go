@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -13,11 +14,12 @@ import (
 	"github.com/drogers0/aistat/v2/internal/providers"
 )
 
-// stubSwitchClient implements switchClaudeClient for tests.
+// stubSwitchClient implements switchable for tests.
 type stubSwitchClient struct {
-	fetchResults    []providers.AccountResult
-	fetchErr        error
-	reconcileCalled bool
+	fetchResults       []providers.AccountResult
+	fetchErr           error
+	reconcileCalled    bool
+	postSwitchVerifyFn func(context.Context, accounts.Account) error
 }
 
 func (s *stubSwitchClient) FetchForSwitch(_ context.Context) ([]providers.AccountResult, error) {
@@ -29,11 +31,18 @@ func (s *stubSwitchClient) ReconcileAndPersist(_ context.Context) error {
 	return nil
 }
 
+func (s *stubSwitchClient) PostSwitchVerify(ctx context.Context, target accounts.Account) error {
+	if s.postSwitchVerifyFn != nil {
+		return s.postSwitchVerifyFn(ctx, target)
+	}
+	return nil
+}
+
 // withSwitchClient swaps newSwitchClient for the duration of the test.
 func withSwitchClient(t *testing.T, stub *stubSwitchClient) {
 	t.Helper()
 	old := newSwitchClient
-	newSwitchClient = func(_ io.Writer, _ string, _ accounts.Store) switchClaudeClient {
+	newSwitchClient = func(_ io.Writer, _ string, _ accounts.Store) switchable {
 		return stub
 	}
 	t.Cleanup(func() { newSwitchClient = old })
@@ -178,17 +187,18 @@ func TestSwitch_ToUUIDPrefixHappyPath(t *testing.T) {
 	}
 }
 
-// Case 3: auto-pick with zero stored accounts → missing-credentials error.
+// Case 3: auto-pick with both stores empty → bulk sees no eligible providers.
 func TestSwitch_AutoPickZeroStored(t *testing.T) {
-	withMemoryStore(t) // empty store
+	withMemoryStore(t)      // empty Claude store
+	withCodexMemoryStore(t) // empty Codex store
 	withSwitchActiveUUID(t, "")
 
 	r := runSwitchTest()
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
 	}
-	if !strings.Contains(r.stderr, "claude /login") {
-		t.Errorf("missing login hint: %q", r.stderr)
+	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
+		t.Errorf("missing expected message: %q", r.stderr)
 	}
 }
 
@@ -230,6 +240,7 @@ func TestSwitch_ToAlreadyActive(t *testing.T) {
 // Case 6: auto-pick, personal 80% remaining, work 20% (work is active) → picks personal.
 func TestSwitch_AutoPickHigherHeadroom(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t) // isolate from any real Codex store on dev machines
 	now := time.Now()
 	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
 	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
@@ -266,6 +277,7 @@ func TestSwitch_AutoPickHigherHeadroom(t *testing.T) {
 // Case 7: auto-pick with active already best → exit 0, "already on best account (<email>)".
 func TestSwitch_AutoPickActiveAlreadyBest(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
 	now := time.Now()
 	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 	seedAccount(t, ms, "uuid-work", "work@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
@@ -300,6 +312,7 @@ func TestSwitch_AutoPickActiveAlreadyBest(t *testing.T) {
 // the one with the more recent LastSeenAt wins.
 func TestSwitch_AutoPickTiebreaker(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
 	now := time.Now()
 	// accountA: 82% remaining, last seen 2 hours ago (floor(82/5)=16)
 	// accountB: 80% remaining, last seen 1 hour ago  (floor(80/5)=16)
@@ -340,6 +353,7 @@ func TestSwitch_AutoPickTiebreaker(t *testing.T) {
 // FetchForSwitch); the other wins.
 func TestSwitch_AutoPickOneFailing(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
 	now := time.Now()
 	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 	seedAccount(t, ms, "uuid-good", "good@example.com", "default_claude_max_20x", now.Add(-30*time.Minute))
@@ -374,6 +388,7 @@ func TestSwitch_AutoPickOneFailing(t *testing.T) {
 // Case 10: auto-pick with ALL non-active accounts failing fetch → exit 2.
 func TestSwitch_AutoPickAllFailing(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
 	now := time.Now()
 	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 	seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
@@ -400,6 +415,7 @@ func TestSwitch_AutoPickAllFailing(t *testing.T) {
 // Case 10b: FetchForSwitch returns an error → exit 2 with usage-fetch error message.
 func TestSwitch_AutoPickFetchError(t *testing.T) {
 	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
 	now := time.Now()
 	seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
 	seedAccount(t, ms, "uuid-other", "other@example.com", "default_claude_max_20x", now.Add(-2*time.Hour))
@@ -423,19 +439,19 @@ func TestSwitch_AutoPickFetchError(t *testing.T) {
 	}
 }
 
-// Case 11: only one account stored and it is active → exit 2.
+// Case 11: Claude has one account, Codex empty → bulk sees no eligible providers.
 func TestSwitch_OnlyOneAccountActive(t *testing.T) {
 	ms := withMemoryStore(t)
 	seedAccount(t, ms, "uuid-personal", "personal@example.com", "default_claude_max_5x", time.Now())
+	withCodexMemoryStore(t) // empty Codex store
 	withSwitchActiveUUID(t, "uuid-personal")
 
 	r := runSwitchTest()
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
 	}
-	want := "only one account stored; nothing to switch to (run `claude /login` to add another)"
-	if !strings.Contains(r.stderr, want) {
-		t.Errorf("wrong error: %q", r.stderr)
+	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
+		t.Errorf("missing expected message: %q", r.stderr)
 	}
 }
 
@@ -511,19 +527,118 @@ func (f *failListStore) List(_ context.Context) ([]accounts.Account, error) {
 func (f *failListStore) Upsert(_ context.Context, _ accounts.Account) error { return nil }
 func (f *failListStore) Delete(_ context.Context, _ string) error            { return nil }
 
-// Extra: store.List failure after successful open → exit 2.
+// Extra: store.List failure after successful open routes through runSwitchInferProvider
+// (because --to is given without a provider). The list error is collected and emitted
+// with the "could not list accounts" format. The Codex store opens empty (no match),
+// so the overall result is no match → exit 2.
 func TestSwitch_StoreListFailure(t *testing.T) {
 	old := openAccountStore
 	openAccountStore = func(_ io.Writer) (accounts.Store, error) {
 		return &failListStore{listErr: errors.New("disk I/O error")}, nil
 	}
 	t.Cleanup(func() { openAccountStore = old })
+	withCodexMemoryStore(t) // empty Codex store for determinism
 
 	r := runSwitchTest("--to", "anyone")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
-	if !strings.Contains(r.stderr, "aistat: claude: could not open account store: disk I/O error") {
+	if !strings.Contains(r.stderr, "aistat: claude: could not list accounts: disk I/O error") {
 		t.Errorf("wrong error: %q", r.stderr)
+	}
+}
+
+// ---- PostSwitchVerify tests (all use Codex scaffold per B4#2) ----
+
+// scaffoldCodexSwitch sets up the Codex scaffold for PostSwitchVerify tests:
+// two accounts ("alice" active-other, "bob" active), active = bob, --to alice.
+// Returns the stub so callers can set postSwitchVerifyFn before calling runSwitchTest.
+func scaffoldCodexSwitch(t *testing.T) *stubCodexSwitchClient {
+	t.Helper()
+	now := time.Now()
+	ms := withCodexMemoryStore(t)
+	seedCodexAccount(t, ms, "uuid-alice", "alice@example.com", "plan", now.Add(-1*time.Hour))
+	seedCodexAccount(t, ms, "uuid-bob", "bob@example.com", "plan", now.Add(-2*time.Hour))
+	withCodexActiveUUID(t, "uuid-bob")
+	withMemoryStore(t) // empty Claude store — must not be touched
+	stub := &stubCodexSwitchClient{}
+	withCodexSwitchClient(t, stub)
+	withCodexWriteBlob(t)
+	return stub
+}
+
+// TestSwitch_PostSwitchVerifyAuthDeniedWarns verifies that a PostSwitchVerify
+// returning ErrAuthDenied causes a warning on stderr but exit 0.
+func TestSwitch_PostSwitchVerifyAuthDeniedWarns(t *testing.T) {
+	stub := scaffoldCodexSwitch(t)
+	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+		return fmt.Errorf("alice@example.com: tokens revoked by upstream...: %w", providers.ErrAuthDenied)
+	}
+
+	r := runSwitchTest("codex", "--to", "alice")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr: %q)", r.code, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "switched to") {
+		t.Errorf("expected 'switched to' in stdout: %q", r.stdout)
+	}
+	wantSubstr := "aistat: codex: switched-to account's tokens are not usable: alice@example.com:"
+	if !strings.Contains(r.stderr, wantSubstr) {
+		t.Errorf("expected %q in stderr: %q", wantSubstr, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "tokens revoked") {
+		t.Errorf("expected 'tokens revoked' in stderr: %q", r.stderr)
+	}
+	if strings.Count(r.stderr, "aistat: codex:") != 1 {
+		t.Errorf("expected exactly one 'aistat: codex:' in stderr, got %d: %q",
+			strings.Count(r.stderr, "aistat: codex:"), r.stderr)
+	}
+}
+
+// TestSwitch_PostSwitchVerifyTransientSilenced verifies that a transient error
+// from PostSwitchVerify does not produce a warning.
+func TestSwitch_PostSwitchVerifyTransientSilenced(t *testing.T) {
+	stub := scaffoldCodexSwitch(t)
+	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+		return providers.ErrTransient
+	}
+
+	r := runSwitchTest("codex", "--to", "alice")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d", r.code)
+	}
+	if strings.Contains(r.stderr, "tokens are not usable") {
+		t.Errorf("transient error should be silenced; stderr: %q", r.stderr)
+	}
+}
+
+// TestSwitch_PostSwitchVerifyNilNoWarn verifies that a nil error from PostSwitchVerify
+// produces no warning.
+func TestSwitch_PostSwitchVerifyNilNoWarn(t *testing.T) {
+	scaffoldCodexSwitch(t) // postSwitchVerifyFn unset → returns nil
+
+	r := runSwitchTest("codex", "--to", "alice")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d", r.code)
+	}
+	if strings.Contains(r.stderr, "tokens are not usable") {
+		t.Errorf("nil verify should produce no warning; stderr: %q", r.stderr)
+	}
+}
+
+// TestSwitch_PostSwitchVerifyNonWrappingErrorSilenced is a regression pin for A2#1/B2#2:
+// a non-%w-wrapped error is treated as non-auth-denied and silenced (not a warning).
+func TestSwitch_PostSwitchVerifyNonWrappingErrorSilenced(t *testing.T) {
+	stub := scaffoldCodexSwitch(t)
+	stub.postSwitchVerifyFn = func(_ context.Context, _ accounts.Account) error {
+		return errors.New("plain error without ErrAuthDenied wrap")
+	}
+
+	r := runSwitchTest("codex", "--to", "alice")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d", r.code)
+	}
+	if strings.Contains(r.stderr, "tokens are not usable") {
+		t.Errorf("non-wrapping error should be silenced; stderr: %q", r.stderr)
 	}
 }

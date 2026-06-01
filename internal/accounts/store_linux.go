@@ -14,14 +14,19 @@ import (
 )
 
 type linuxStore struct {
+	provider Provider
 	path     string
 	lockPath string
 }
 
-// OpenStore returns the Linux file-backed account store at
-// ~/.config/aistat/accounts/claude.json. The parent directory is created with
-// mode 0700 if absent.
-func OpenStore(opts ...Option) (Store, error) {
+// OpenStore returns the Linux file-backed account store for the given provider.
+// The data file and lock sentinel are created under ~/.config/aistat/accounts/;
+// paths are <provider>.json and .<provider>.lock respectively.
+// The parent directory is created with mode 0700 if absent.
+func OpenStore(provider Provider, opts ...Option) (Store, error) {
+	if err := provider.validate(); err != nil {
+		return nil, err
+	}
 	// opts are accepted for API consistency; WithDebug is darwin-only.
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -31,9 +36,11 @@ func OpenStore(opts ...Option) (Store, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("accounts: cannot create accounts dir %s: %w", dir, err)
 	}
+	p := string(provider)
 	return &linuxStore{
-		path:     filepath.Join(dir, "claude.json"),
-		lockPath: filepath.Join(dir, ".claude.lock"),
+		provider: provider,
+		path:     filepath.Join(dir, p+".json"),
+		lockPath: filepath.Join(dir, "."+p+".lock"),
 	}, nil
 }
 
@@ -87,7 +94,7 @@ func (s *linuxStore) atomicWrite(m map[string]Account) error {
 		return err
 	}
 	dir := filepath.Dir(s.path)
-	tmp, err := os.CreateTemp(dir, ".claude-*.json.tmp")
+	tmp, err := os.CreateTemp(dir, "."+string(s.provider)+"-*.json.tmp")
 	if err != nil {
 		return fmt.Errorf("accounts: create temp file: %w", err)
 	}

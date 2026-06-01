@@ -26,10 +26,17 @@ func stubResolver(activeUUID string) func(context.Context, []accounts.Account) (
 	}
 }
 
-// runAccounts helper: run runAccountsInner with a MemoryStore and the given resolver.
-func runAccountsTest(store *accounts.MemoryStore, resolver func(context.Context, []accounts.Account) (string, error), args ...string) runResult {
+// runAccountsTest calls runAccounts with a single-provider (Claude) providerStore
+// built from the given store and resolver. g controls rendering (Human: true for text).
+func runAccountsTest(store *accounts.MemoryStore, resolver func(context.Context, []accounts.Account) (string, error), g globals, args ...string) runResult {
 	var stdout, stderr bytes.Buffer
-	code := runAccounts(args, &stdout, &stderr, globals{}, store, resolver)
+	ps := []providerStore{{
+		id:             "claude",
+		store:          store,
+		activeResolver: resolver,
+		logoutHint:     "use 'claude /logout' first",
+	}}
+	code := runAccounts(args, &stdout, &stderr, g, ps)
 	return runResult{stdout.String(), stderr.String(), code}
 }
 
@@ -52,7 +59,7 @@ func seedAccount(t *testing.T, ms *accounts.MemoryStore, uuid, email, plan strin
 
 func TestAccounts_EmptySubcmd(t *testing.T) {
 	ms := accounts.NewMemoryStore()
-	r := runAccountsTest(ms, noopResolver) // no args → empty sub
+	r := runAccountsTest(ms, noopResolver, globals{}) // no args → empty sub
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -64,7 +71,7 @@ func TestAccounts_EmptySubcmd(t *testing.T) {
 
 func TestAccounts_UnknownSubcmd(t *testing.T) {
 	ms := accounts.NewMemoryStore()
-	r := runAccountsTest(ms, noopResolver, "foo")
+	r := runAccountsTest(ms, noopResolver, globals{}, "foo")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -95,11 +102,11 @@ func TestAccountsSubcmd_StoreOpenFailure(t *testing.T) {
 	}
 }
 
-// --- accounts list ---
+// --- accounts list (text mode via globals{Human: true}) ---
 
 func TestAccountsList_EmptyStore(t *testing.T) {
 	ms := accounts.NewMemoryStore()
-	r := runAccountsTest(ms, noopResolver, "list")
+	r := runAccountsTest(ms, noopResolver, globals{Human: true}, "list")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
 	}
@@ -114,7 +121,7 @@ func TestAccountsList_NotStaleAt30Days(t *testing.T) {
 	lastSeen := time.Now().Add(-30*24*time.Hour + time.Minute)
 	seedAccount(t, ms, "aaaa-1111", "user@example.com", "default_claude_max_5x", lastSeen)
 
-	r := runAccountsTest(ms, noopResolver, "list")
+	r := runAccountsTest(ms, noopResolver, globals{Human: true}, "list")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d", r.code)
 	}
@@ -132,7 +139,7 @@ func TestAccountsList_StaleAfter30DaysPlus1Minute(t *testing.T) {
 	lastSeen := time.Now().Add(-30*24*time.Hour - time.Minute)
 	seedAccount(t, ms, "bbbb-2222", "old@example.com", "default_claude_pro", lastSeen)
 
-	r := runAccountsTest(ms, noopResolver, "list")
+	r := runAccountsTest(ms, noopResolver, globals{Human: true}, "list")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d", r.code)
 	}
@@ -148,7 +155,7 @@ func TestAccountsList_SortedByEmail(t *testing.T) {
 	seedAccount(t, ms, "uuid-a", "a@example.com", "plan", now)
 	seedAccount(t, ms, "uuid-m", "m@example.com", "plan", now)
 
-	r := runAccountsTest(ms, noopResolver, "list")
+	r := runAccountsTest(ms, noopResolver, globals{Human: true}, "list")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d", r.code)
 	}
@@ -164,7 +171,7 @@ func TestAccountsList_SortedByEmail(t *testing.T) {
 
 func TestAccountsRemove_NoArg(t *testing.T) {
 	ms := accounts.NewMemoryStore()
-	r := runAccountsTest(ms, noopResolver, "remove")
+	r := runAccountsTest(ms, noopResolver, globals{}, "remove")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -177,7 +184,7 @@ func TestAccountsRemove_NoMatch(t *testing.T) {
 	ms := accounts.NewMemoryStore()
 	seedAccount(t, ms, "cccc-3333", "real@example.com", "plan", time.Now())
 
-	r := runAccountsTest(ms, noopResolver, "remove", "nobody@example.com")
+	r := runAccountsTest(ms, noopResolver, globals{}, "remove", "nobody@example.com")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -192,7 +199,7 @@ func TestAccountsRemove_MultipleMatches(t *testing.T) {
 	seedAccount(t, ms, "eeee-5555", "work@other.com", "plan", time.Now())
 
 	// "work" matches both emails via substring.
-	r := runAccountsTest(ms, noopResolver, "remove", "work")
+	r := runAccountsTest(ms, noopResolver, globals{}, "remove", "work")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -209,7 +216,7 @@ func TestAccountsRemove_ActiveProtection(t *testing.T) {
 	seedAccount(t, ms, activeUUID, "active@example.com", "plan", time.Now())
 
 	// Resolver reports this account as active.
-	r := runAccountsTest(ms, stubResolver(activeUUID), "remove", "active@example.com")
+	r := runAccountsTest(ms, stubResolver(activeUUID), globals{}, "remove", "active@example.com")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d", r.code)
 	}
@@ -233,7 +240,7 @@ func TestAccountsRemove_ResolverErrorFailsClosed(t *testing.T) {
 	errResolver := func(_ context.Context, _ []accounts.Account) (string, error) {
 		return "", errors.New("profile lookup timed out")
 	}
-	r := runAccountsTest(ms, errResolver, "remove", "target@example.com")
+	r := runAccountsTest(ms, errResolver, globals{}, "remove", "target@example.com")
 	if r.code != 2 {
 		t.Fatalf("expected exit 2, got %d (stderr %q)", r.code, r.stderr)
 	}
@@ -258,7 +265,7 @@ func TestAccountsRemove_HappyPath(t *testing.T) {
 	seedAccount(t, ms, uuid, "gone@example.com", "plan", time.Now())
 
 	// A different UUID is active → remove is allowed.
-	r := runAccountsTest(ms, stubResolver("other-uuid"), "remove", "gone@example.com")
+	r := runAccountsTest(ms, stubResolver("other-uuid"), globals{}, "remove", "gone@example.com")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
 	}
@@ -284,7 +291,7 @@ func TestAccountsRemove_UUIDPrefix(t *testing.T) {
 	seedAccount(t, ms, uuid, "user@example.com", "plan", time.Now())
 
 	// 8+ hex chars prefix matches.
-	r := runAccountsTest(ms, noopResolver, "remove", "abcdef01")
+	r := runAccountsTest(ms, noopResolver, globals{}, "remove", "abcdef01")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0 for UUID-prefix remove, got %d (stderr %q)", r.code, r.stderr)
 	}
@@ -299,7 +306,7 @@ func TestAccountsRemove_EmailSubstring(t *testing.T) {
 	seedAccount(t, ms, "hhhh-8888", "david@personal.com", "plan", time.Now())
 
 	// "personal" matches as email substring.
-	r := runAccountsTest(ms, noopResolver, "remove", "personal")
+	r := runAccountsTest(ms, noopResolver, globals{}, "remove", "personal")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0 for email-substring remove, got %d (stderr %q)", r.code, r.stderr)
 	}

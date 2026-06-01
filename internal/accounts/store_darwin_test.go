@@ -28,11 +28,29 @@ func skipUnlessLive(t *testing.T) {
 // test items into the user's keychain.
 func forceDeleteSentinel(uuid string) {
 	ctx := context.Background()
-	svc := darwinServicePrefix + uuid
+	svc := darwinPerAccountService(ProviderClaude, uuid)
 	darwinDeleteItem(ctx, svc, "")
 	// Best-effort index clean: open store and delete. Ignore errors.
-	if s, err := OpenStore(); err == nil {
+	if s, err := OpenStore(ProviderClaude); err == nil {
 		s.Delete(ctx, uuid)
+	}
+}
+
+// TestDarwinServiceNaming pins the per-account and index service name formats
+// before Step 4 introduces provider parameterization. These tests are non-live
+// and do not require AISTAT_LIVE_KEYCHAIN.
+func TestDarwinServiceNaming_PerAccount(t *testing.T) {
+	uuid := "550e8400-e29b-41d4-a716-446655440000"
+	want := "aistat:accounts:claude:" + uuid
+	if got := darwinPerAccountService(ProviderClaude, uuid); got != want {
+		t.Errorf("darwinPerAccountService: got %q, want %q", got, want)
+	}
+}
+
+func TestDarwinServiceNaming_Index(t *testing.T) {
+	want := "aistat:accounts:claude:index"
+	if got := darwinAccountIndexService(ProviderClaude); got != want {
+		t.Errorf("darwinAccountIndexService: got %q, want %q", got, want)
 	}
 }
 
@@ -41,7 +59,7 @@ func TestDarwinStore_AddListDelete(t *testing.T) {
 
 	t.Cleanup(func() { forceDeleteSentinel(sentinelUUID) })
 
-	s, err := OpenStore()
+	s, err := OpenStore(ProviderClaude)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -93,7 +111,7 @@ func TestDarwinStore_OrphanIndexHandling(t *testing.T) {
 		forceDeleteSentinel(liveUUID)
 	})
 
-	s, err := OpenStore()
+	s, err := OpenStore(ProviderClaude)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -122,7 +140,7 @@ func TestDarwinStore_OrphanIndexHandling(t *testing.T) {
 
 	// List should skip the orphan entry and return only the live account.
 	var debugBuf bytes.Buffer
-	sWithDebug, err := OpenStore(WithDebug(&debugBuf))
+	sWithDebug, err := OpenStore(ProviderClaude, WithDebug(&debugBuf))
 	if err != nil {
 		t.Fatalf("OpenStore with debug: %v", err)
 	}
@@ -148,7 +166,7 @@ func TestDarwinStore_ConcurrentUpserts(t *testing.T) {
 		forceDeleteSentinel(uuid2)
 	})
 
-	s, err := OpenStore()
+	s, err := OpenStore(ProviderClaude)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}
@@ -193,7 +211,7 @@ func TestDarwinStore_IndexGrowsAndShrinks(t *testing.T) {
 		forceDeleteSentinel(uuid2)
 	})
 
-	s, err := OpenStore()
+	s, err := OpenStore(ProviderClaude)
 	if err != nil {
 		t.Fatalf("OpenStore: %v", err)
 	}

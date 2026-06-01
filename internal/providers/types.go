@@ -104,7 +104,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// AccountResult is one stored Claude account's contribution to a ProviderResult.
+// AccountResult is one stored provider account's contribution to a ProviderResult.
 // Active is intentionally not omitempty — false is meaningful (the account is
 // stored but not currently live). Limits is intentionally NOT omitempty so a
 // successful fetch with zero recognized windows still serializes as

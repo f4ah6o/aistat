@@ -64,11 +64,21 @@ func (f *fakeProvider) Fetch(ctx context.Context) (providers.ProviderOutput, err
 			},
 		}, nil
 	case "codex":
-		return providers.ProviderOutput{Limits: map[string]providers.Limit{
+		codexLimits := map[string]providers.Limit{
 			"five_hour":             mk(0, 3*time.Hour+12*time.Minute),
 			"seven_day":             mk(11, 4*24*time.Hour+1*time.Hour),
 			"code_review_seven_day": mk(0, 4*24*time.Hour+1*time.Hour),
-		}}, nil
+		}
+		return providers.ProviderOutput{
+			Accounts: []providers.AccountResult{
+				{
+					Email:  "user@codex.example.com",
+					UUID:   "cccccccc-1111-2222-3333-444444444444",
+					Active: true,
+					Limits: codexLimits,
+				},
+			},
+		}, nil
 	case "copilot":
 		return providers.ProviderOutput{Limits: map[string]providers.Limit{
 			"month": mk(4, 5*24*time.Hour+7*time.Hour),

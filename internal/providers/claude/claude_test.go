@@ -19,6 +19,7 @@ import (
 	"github.com/drogers0/aistat/v2/internal/cred"
 	"github.com/drogers0/aistat/v2/internal/httpx"
 	"github.com/drogers0/aistat/v2/internal/providers"
+	"github.com/drogers0/aistat/v2/internal/providers/usagecache"
 	"github.com/drogers0/aistat/v2/internal/testutil"
 )
 
@@ -159,7 +160,7 @@ func buildClient(
 		now:              nowFn,
 		baseTimeout:      10 * time.Second,
 		perAccountBudget: 3 * time.Second,
-		cache:            newUsageCache(nowFn, warnFn),
+		cache:            usagecache.New("claude", nowFn, warnFn),
 	}
 }
 
@@ -898,10 +899,10 @@ func TestFetch_RotatedTokensPersisted(t *testing.T) {
 	if len(stored) != 1 {
 		t.Fatalf("store should have 1 account, got %d", len(stored))
 	}
-	if got := stored[0].AccessToken(); got != "tok-a2" {
+	if got := StoredAccessToken(stored[0]); got != "tok-a2" {
 		t.Errorf("stored AccessToken = %q, want tok-a2", got)
 	}
-	if got := stored[0].RefreshToken(); got != "ref-a2" {
+	if got := StoredRefreshToken(stored[0]); got != "ref-a2" {
 		t.Errorf("stored RefreshToken = %q, want ref-a2", got)
 	}
 }
@@ -938,7 +939,7 @@ func TestFetchForSwitch_NeverRefreshesNeverMutatesStore(t *testing.T) {
 	stored, _ := store.List(context.Background())
 	for _, s := range stored {
 		if s.UUID == "uuid-other" {
-			if got := s.RefreshToken(); got != "ref-other" {
+			if got := StoredRefreshToken(s); got != "ref-other" {
 				t.Errorf("store RefreshToken = %q, want ref-other (store must be unchanged)", got)
 			}
 		}
@@ -1133,11 +1134,11 @@ func TestFetch_RotateExpiresAtZero(t *testing.T) {
 	if len(stored) != 1 {
 		t.Fatalf("store should have 1 account, got %d", len(stored))
 	}
-	if got := stored[0].AccessToken(); got != "tok-a2" {
+	if got := StoredAccessToken(stored[0]); got != "tok-a2" {
 		t.Errorf("stored AccessToken = %q, want tok-a2", got)
 	}
 	// expiresAt must be 0, not the old nearExpiry value.
-	if got := stored[0].ExpiresAt(); got != 0 {
+	if got := StoredExpiresAt(stored[0]); got != 0 {
 		t.Errorf("stored ExpiresAt = %d, want 0 (no expiry from server)", got)
 	}
 }
@@ -1435,7 +1436,7 @@ func TestFetch_CacheMissRepeatedRetryAfterExceedsBudget(t *testing.T) {
 		now:              nowFn,
 		baseTimeout:      0,              // no base buffer: pool = just perAccountBudget
 		perAccountBudget: 3 * time.Second, // 0+3=3 s pool; 2nd Retry-After:2 sleep (0+2+2=4 s) exceeds it
-		cache:            newUsageCache(nowFn, func(string) {}),
+		cache:            usagecache.New("claude", nowFn, func(string) {}),
 	}
 
 	start := time.Now()

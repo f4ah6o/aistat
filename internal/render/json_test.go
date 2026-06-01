@@ -200,3 +200,37 @@ func TestJSON_AccountResultActiveFalse(t *testing.T) {
 		t.Fatalf("Active=false must not be omitted: %s", buf.String())
 	}
 }
+
+func TestJSON_CodexAccountsOrdering(t *testing.T) {
+	// Same active-first slice-order contract as Claude. Codex multi-account
+	// must emit the same JSON shape (top-level "accounts", no top-level
+	// "limits" key when Accounts is populated).
+	r := providers.Report{
+		Providers: map[string]providers.ProviderResult{
+			"codex": {Accounts: []providers.AccountResult{
+				{Email: "b@example.com", Active: true},
+				{Email: "a@example.com", Active: false},
+			}},
+		},
+	}
+	var buf bytes.Buffer
+	_ = JSON(&buf, r)
+	s := buf.String()
+	iB := strings.Index(s, `"b@example.com"`)
+	iA := strings.Index(s, `"a@example.com"`)
+	if iB < 0 || iA < 0 || iB >= iA {
+		t.Fatalf("active account b should appear before a: %s", s)
+	}
+	// When Accounts is populated, top-level "limits" must be omitted for codex
+	// just as it is for claude.
+	if strings.Contains(s, `"limits":`) && !strings.Contains(s, `"limits": null`) {
+		// allow per-account "limits": null/{} but not top-level "limits": ...
+		// crude check: find first "codex" then look for "limits" before "accounts"
+		ci := strings.Index(s, `"codex"`)
+		ai := strings.Index(s[ci:], `"accounts"`)
+		li := strings.Index(s[ci:], `"limits"`)
+		if li >= 0 && li < ai {
+			t.Fatalf("top-level codex.limits should be omitted when accounts is populated: %s", s)
+		}
+	}
+}

@@ -51,9 +51,6 @@ func TestNewAccount_HappyPath(t *testing.T) {
 	if !a.LastSeenAt.Equal(now) {
 		t.Errorf("LastSeenAt: got %v, want %v", a.LastSeenAt, now)
 	}
-	if a.AccessToken() != "at-abc" {
-		t.Errorf("AccessToken: got %q, want %q", a.AccessToken(), "at-abc")
-	}
 }
 
 func TestNewAccount_EmptyRaw(t *testing.T) {
@@ -70,14 +67,6 @@ func TestNewAccount_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestNewAccount_MissingAccessToken(t *testing.T) {
-	raw := json.RawMessage(`{"claudeAiOauth":{"accessToken":""}}`)
-	_, err := NewAccount(raw, "uuid-1", "user@example.com", "", "", time.Now())
-	if err == nil {
-		t.Fatal("expected error for empty accessToken")
-	}
-}
-
 func TestNewAccount_EmptyUUID(t *testing.T) {
 	raw := rawBlob("at-abc", "rt-xyz", 0)
 	_, err := NewAccount(raw, "", "user@example.com", "", "", time.Now())
@@ -86,43 +75,24 @@ func TestNewAccount_EmptyUUID(t *testing.T) {
 	}
 }
 
-func TestNewAccount_MissingClaudeAiOauthField(t *testing.T) {
+// TestNewAccount_NoAccessTokenRequired verifies that NewAccount no longer
+// requires claudeAiOauth.accessToken — token validation is provider-specific.
+func TestNewAccount_NoAccessTokenRequired(t *testing.T) {
+	// Raw JSON with valid JSON but no accessToken field.
+	raw := json.RawMessage(`{"claudeAiOauth":{"accessToken":""}}`)
+	_, err := NewAccount(raw, "uuid-1", "user@example.com", "", "", time.Now())
+	if err != nil {
+		t.Fatalf("NewAccount should succeed without accessToken; got %v", err)
+	}
+}
+
+// TestNewAccount_AnyValidJSONAccepted verifies that any valid JSON is accepted
+// regardless of shape — provider-neutrality means we don't inspect the fields.
+func TestNewAccount_AnyValidJSONAccepted(t *testing.T) {
 	raw := json.RawMessage(`{"otherField":"value"}`)
 	_, err := NewAccount(raw, "uuid-1", "user@example.com", "", "", time.Now())
-	if err == nil {
-		t.Fatal("expected error when claudeAiOauth is absent")
-	}
-}
-
-func TestAccount_ZeroValueSafe(t *testing.T) {
-	var a Account
-	if got := a.AccessToken(); got != "" {
-		t.Errorf("zero-value AccessToken: got %q, want empty", got)
-	}
-	if got := a.RefreshToken(); got != "" {
-		t.Errorf("zero-value RefreshToken: got %q, want empty", got)
-	}
-	if got := a.ExpiresAt(); got != 0 {
-		t.Errorf("zero-value ExpiresAt: got %d, want 0", got)
-	}
-}
-
-func TestAccount_TokenMethods(t *testing.T) {
-	raw := rawBlob("at-abc", "rt-xyz", 9876543210000)
-	now := time.Now()
-	a, err := NewAccount(raw, "uuid-1", "u@x.com", "", "", now)
 	if err != nil {
-		t.Fatalf("NewAccount: %v", err)
-	}
-
-	if got := a.AccessToken(); got != "at-abc" {
-		t.Errorf("AccessToken: got %q", got)
-	}
-	if got := a.RefreshToken(); got != "rt-xyz" {
-		t.Errorf("RefreshToken: got %q", got)
-	}
-	if got := a.ExpiresAt(); got != 9876543210000 {
-		t.Errorf("ExpiresAt: got %d", got)
+		t.Fatalf("NewAccount should accept any valid JSON; got %v", err)
 	}
 }
 
@@ -143,34 +113,13 @@ func TestAccount_RoundTrip(t *testing.T) {
 		t.Fatalf("Unmarshal: %v", err)
 	}
 
-	if restored.AccessToken() != orig.AccessToken() {
-		t.Errorf("AccessToken after round-trip: got %q, want %q", restored.AccessToken(), orig.AccessToken())
-	}
-	if restored.RefreshToken() != orig.RefreshToken() {
-		t.Errorf("RefreshToken after round-trip: got %q, want %q", restored.RefreshToken(), orig.RefreshToken())
-	}
-	if restored.ExpiresAt() != orig.ExpiresAt() {
-		t.Errorf("ExpiresAt after round-trip: got %d, want %d", restored.ExpiresAt(), orig.ExpiresAt())
-	}
 	if restored.UUID != orig.UUID {
 		t.Errorf("UUID after round-trip: got %q, want %q", restored.UUID, orig.UUID)
 	}
-}
-
-func TestAccount_MalformedRawBlob(t *testing.T) {
-	// Accounts with a malformed RawBlob (e.g. loaded from a corrupt store entry)
-	// should return safe zero values from token methods, not panic.
-	a := Account{
-		UUID:    "uuid-bad",
-		RawBlob: json.RawMessage(`{not valid json`),
+	if restored.Email != orig.Email {
+		t.Errorf("Email after round-trip: got %q, want %q", restored.Email, orig.Email)
 	}
-	if got := a.AccessToken(); got != "" {
-		t.Errorf("AccessToken on malformed blob: got %q, want empty", got)
-	}
-	if got := a.RefreshToken(); got != "" {
-		t.Errorf("RefreshToken on malformed blob: got %q, want empty", got)
-	}
-	if got := a.ExpiresAt(); got != 0 {
-		t.Errorf("ExpiresAt on malformed blob: got %d, want 0", got)
+	if string(restored.RawBlob) != string(orig.RawBlob) {
+		t.Errorf("RawBlob after round-trip: got %q, want %q", restored.RawBlob, orig.RawBlob)
 	}
 }

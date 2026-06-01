@@ -2,11 +2,11 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/drogers0/aistat/v2/internal/accounts"
 )
@@ -209,20 +209,16 @@ func TestCLI_SwitchHelp(t *testing.T) {
 }
 
 func TestCLI_SwitchNoStoredAccounts(t *testing.T) {
-	// Auto-pick with zero stored accounts → missing-credentials error.
+	// Bulk switch with both stores empty → no eligible providers → exit 0.
 	withMemoryStore(t)
-	oldResolver := switchLookupActiveUUID
-	switchLookupActiveUUID = func(_ context.Context, _ []accounts.Account, _ io.Writer) (string, error) {
-		return "", nil
-	}
-	t.Cleanup(func() { switchLookupActiveUUID = oldResolver })
+	withCodexMemoryStore(t)
 
 	r := runCLI("switch")
-	if r.code != 2 {
-		t.Fatalf("expected exit 2, got %d", r.code)
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d", r.code)
 	}
-	if !strings.Contains(r.stderr, "claude /login") {
-		t.Fatalf("missing login hint: %s", r.stderr)
+	if !strings.Contains(r.stderr, "no providers have multiple stored accounts") {
+		t.Fatalf("missing expected message: %s", r.stderr)
 	}
 }
 
@@ -242,13 +238,18 @@ func TestCLI_AccountsNoSubcmd(t *testing.T) {
 
 func TestCLI_AccountsList(t *testing.T) {
 	withMemoryStore(t)
+	withCodexMemoryStore(t)
 	r := runCLI("accounts", "list")
 	if r.code != 0 {
 		t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
 	}
-	// Empty store → no output.
-	if r.stdout != "" {
-		t.Fatalf("expected empty stdout for empty store, got %q", r.stdout)
+	// JSON output for empty stores: both provider keys present.
+	var result map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &result); err != nil {
+		t.Fatalf("expected valid JSON, got %q: %v", r.stdout, err)
+	}
+	if _, ok := result["claude"]; !ok {
+		t.Fatalf("missing claude key in JSON: %s", r.stdout)
 	}
 }
 
@@ -271,5 +272,55 @@ func TestCLI_AccountsListVersion(t *testing.T) {
 	}
 	if got := strings.TrimSpace(r.stdout); got == "" {
 		t.Fatalf("expected non-empty version, got empty")
+	}
+}
+
+// --- New T4 integration tests ---
+
+func TestCLI_AccountsListClaudeProviderArg(t *testing.T) {
+	withMemoryStore(t)
+	withCodexMemoryStore(t)
+	r := runCLI("accounts", "list", "claude")
+	if r.code != 0 {
+		t.Fatalf("expected exit 0, got %d (stderr %q)", r.code, r.stderr)
+	}
+	var result map[string]any
+	if err := json.Unmarshal([]byte(r.stdout), &result); err != nil {
+		t.Fatalf("expected valid JSON, got %q: %v", r.stdout, err)
+	}
+	if _, ok := result["claude"]; !ok {
+		t.Fatalf("missing claude key in JSON: %s", r.stdout)
+	}
+	if _, ok := result["codex"]; ok {
+		t.Fatalf("codex key should be absent for single-provider list: %s", r.stdout)
+	}
+}
+
+func TestCLI_AccountsRemoveUnknownProvider(t *testing.T) {
+	withMemoryStore(t)
+	withCodexMemoryStore(t)
+	r := runCLI("accounts", "remove", "some-id", "bogus")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "unknown provider") {
+		t.Fatalf("missing unknown provider error: %s", r.stderr)
+	}
+}
+
+// TestCLI_SwitchClaudeOneAccountHint verifies that the Claude-specific login hint
+// is shown when `aistat switch claude` is invoked with only one stored account.
+func TestCLI_SwitchClaudeOneAccountHint(t *testing.T) {
+	ms := withMemoryStore(t)
+	withCodexMemoryStore(t)
+	seedAccount(t, ms, "uuid-only", "only@example.com", "plan", time.Now())
+	withSwitchActiveUUID(t, "uuid-only")
+
+	r := runCLI("switch", "claude")
+	if r.code != 2 {
+		t.Fatalf("expected exit 2, got %d", r.code)
+	}
+	if !strings.Contains(r.stderr, "claude /login") {
+		t.Fatalf("missing Claude login hint: %s", r.stderr)
 	}
 }
