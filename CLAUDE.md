@@ -81,6 +81,7 @@ These are upstream OAuth-provider behaviors aistat cannot work around without re
 
 ## Working in this repo
 
+- Tests follow the table-driven `t.Run` subtest convention — see [TESTING.md](TESTING.md).
 - Run `go test ./...` (and `go test -race ./...`) before declaring a change done. Use `go vet ./...` and `staticcheck` (pinned in CI to `2025.1.1`) for static checks. CI runs on both ubuntu-latest and macos-latest — fix Linux failures locally with `GOOS=linux go vet ./... && GOOS=linux ~/go/bin/staticcheck ./...`.
 - Fake-mode smoke (`go build -tags=fake -o /tmp/aistat ./cmd/aistat && /tmp/aistat --fake`) renders all providers (Claude + Codex + Copilot) in JSON without touching real credentials; add `-h` for human-readable. Vet + staticcheck under `-tags=fake` are part of the smoke surface.
 - The Claude provider is macOS/Linux-only. macOS reads/writes the Keychain item `Claude Code-credentials` (and the per-account store at service `aistat:accounts:claude:<uuid>`); Linux reads/writes `~/.claude/.credentials.json` and the per-account store at `~/.config/aistat/accounts/claude.json`. The Codex provider is portable: live blob always `~/.codex/auth.json`, per-account store mirrors Claude's split (`aistat:accounts:codex:<sub>` on macOS, `~/.config/aistat/accounts/codex.json` on Linux). Copilot is portable.

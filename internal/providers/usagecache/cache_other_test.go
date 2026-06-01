@@ -27,39 +27,50 @@ func TestCacheOther_PutNoOps(t *testing.T) {
 	}
 }
 
-func TestCacheOther_WarnFiresOnce(t *testing.T) {
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-	c := New("claude", nil, warnFn)
+// TestCacheOther_Warn asserts that the warn fires exactly once on first use
+// and that the message includes the provider name.
+func TestCacheOther_Warn(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{"fires once", func(t *testing.T) {
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+			c := New("claude", nil, warnFn)
 
-	// Warn must not fire at construction.
-	if len(warns) != 0 {
-		t.Fatalf("warn fired at construction: want 0, got %d", len(warns))
+			// Warn must not fire at construction.
+			if len(warns) != 0 {
+				t.Fatalf("warn fired at construction: want 0, got %d", len(warns))
+			}
+
+			c.Get("uuid-1")
+			if len(warns) != 1 {
+				t.Fatalf("warn count after first Get: want 1, got %d", len(warns))
+			}
+
+			// Subsequent calls are silent.
+			c.Get("uuid-2")
+			c.Put("uuid-3", nil)
+			if len(warns) != 1 {
+				t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
+			}
+		}},
+		{"message includes provider", func(t *testing.T) {
+			var warns []string
+			warnFn := func(s string) { warns = append(warns, s) }
+			c := New("claude", nil, warnFn)
+
+			c.Get("any-uuid")
+			if len(warns) != 1 {
+				t.Fatalf("want 1 warn, got %d", len(warns))
+			}
+			if !strings.Contains(warns[0], "aistat: claude: usage cache disabled") {
+				t.Errorf("warn message: got %q, want substring %q", warns[0], "aistat: claude: usage cache disabled")
+			}
+		}},
 	}
-
-	c.Get("uuid-1")
-	if len(warns) != 1 {
-		t.Fatalf("warn count after first Get: want 1, got %d", len(warns))
-	}
-
-	// Subsequent calls are silent.
-	c.Get("uuid-2")
-	c.Put("uuid-3", nil)
-	if len(warns) != 1 {
-		t.Errorf("warn count after repeated calls: want 1, got %d", len(warns))
-	}
-}
-
-func TestCacheOther_WarnMessageIncludesProvider(t *testing.T) {
-	var warns []string
-	warnFn := func(s string) { warns = append(warns, s) }
-	c := New("claude", nil, warnFn)
-
-	c.Get("any-uuid")
-	if len(warns) != 1 {
-		t.Fatalf("want 1 warn, got %d", len(warns))
-	}
-	if !strings.Contains(warns[0], "aistat: claude: usage cache disabled") {
-		t.Errorf("warn message: got %q, want substring %q", warns[0], "aistat: claude: usage cache disabled")
+	for _, tt := range tests {
+		t.Run(tt.name, tt.run)
 	}
 }

@@ -6,58 +6,51 @@ import (
 	"testing"
 )
 
-func TestProvider_ValidateClaude(t *testing.T) {
-	if err := ProviderClaude.validate(); err != nil {
-		t.Errorf("ProviderClaude.validate(): want nil, got %v", err)
+func TestProviderValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		p       Provider
+		wantErr bool
+	}{
+		{"claude is valid", ProviderClaude, false},
+		{"codex is valid", ProviderCodex, false},
+		{"empty string errors", Provider(""), true},
+		{"path traversal errors", Provider("../attack"), true},
+		{"unknown provider errors", Provider("unknown"), true},
+		{"path separator errors", Provider("claude/foo"), true},
 	}
-}
-
-func TestProvider_ValidateCodex(t *testing.T) {
-	if err := ProviderCodex.validate(); err != nil {
-		t.Errorf("ProviderCodex.validate(): want nil, got %v", err)
-	}
-}
-
-func TestProvider_ValidateEmpty(t *testing.T) {
-	if err := Provider("").validate(); err == nil {
-		t.Error("Provider(\"\").validate(): want error, got nil")
-	}
-}
-
-func TestProvider_ValidatePathTraversal(t *testing.T) {
-	if err := Provider("../attack").validate(); err == nil {
-		t.Error("Provider(\"../attack\").validate(): want error, got nil")
-	}
-}
-
-func TestProvider_ValidateUnknown(t *testing.T) {
-	if err := Provider("unknown").validate(); err == nil {
-		t.Error("Provider(\"unknown\").validate(): want error, got nil")
-	}
-}
-
-func TestProvider_ValidatePathSeparator(t *testing.T) {
-	if err := Provider("claude/foo").validate(); err == nil {
-		t.Error("Provider(\"claude/foo\").validate(): want error, got nil")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.p.validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("Provider(%q).validate(): want error, got nil", tt.p)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Provider(%q).validate(): want nil, got %v", tt.p, err)
+			}
+		})
 	}
 }
 
 // TestOpenStore_InvalidProvider asserts that OpenStore returns an error for
 // invalid provider strings on every supported platform.
 func TestOpenStore_InvalidProvider(t *testing.T) {
-	cases := []Provider{
-		Provider(""),
-		Provider("../attack"),
-		Provider("unknown"),
-		Provider("claude/foo"),
+	tests := []struct {
+		name string
+		p    Provider
+	}{
+		{"empty string", Provider("")},
+		{"path traversal", Provider("../attack")},
+		{"unknown provider", Provider("unknown")},
+		{"path separator", Provider("claude/foo")},
 	}
-	for _, p := range cases {
-		t.Run(string(p), func(t *testing.T) {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 			// Use a temp home so no real credential dirs are touched.
 			t.Setenv("HOME", t.TempDir())
-			_, err := OpenStore(p)
+			_, err := OpenStore(tt.p)
 			if err == nil {
-				t.Errorf("OpenStore(%q): want error, got nil", p)
+				t.Errorf("OpenStore(%q): want error, got nil", tt.p)
 			}
 		})
 	}
