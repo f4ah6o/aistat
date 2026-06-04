@@ -193,6 +193,62 @@ func TestParseCodexIDToken(t *testing.T) {
 	}
 }
 
+// --- ParseJWTExp tests ---
+
+func TestParseJWTExp(t *testing.T) {
+	tests := []struct {
+		name    string
+		run     func(t *testing.T) (int64, bool)
+		wantExp int64
+		wantOK  bool
+	}{
+		{"present", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"sub":"u1","exp":1700000000}`))
+		}, 1700000000, true},
+		{"past exp still returned", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"exp":1000000000}`))
+		}, 1000000000, true},
+		{"float exp truncated", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"exp":1700000000.9}`))
+		}, 1700000000, true},
+		{"exp absent", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"sub":"u1"}`))
+		}, 0, false},
+		{"exp zero", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"exp":0}`))
+		}, 0, false},
+		{"exp negative", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp(makeTestJWT(t, `{"exp":-1}`))
+		}, 0, false},
+		{"opaque non-jwt", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("test-access-token-abc")
+		}, 0, false},
+		{"two segments", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("header.payload")
+		}, 0, false},
+		{"empty segment", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("a..c")
+		}, 0, false},
+		{"bad base64 payload", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("header.!!!.sig")
+		}, 0, false},
+		{"bad json payload", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("header." + base64.RawURLEncoding.EncodeToString([]byte("not json")) + ".sig")
+		}, 0, false},
+		{"empty", func(t *testing.T) (int64, bool) {
+			return ParseJWTExp("")
+		}, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expSec, ok := tt.run(t)
+			if expSec != tt.wantExp || ok != tt.wantOK {
+				t.Errorf("ParseJWTExp = (%d, %t), want (%d, %t)", expSec, ok, tt.wantExp, tt.wantOK)
+			}
+		})
+	}
+}
+
 // --- ReadCodexCredential tests ---
 
 const testIDToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJjb2RleC10ZXN0LXN1YiIsImVtYWlsIjoidGVzdEBleGFtcGxlLmNvbSIsImV4cCI6OTk5OTk5OTk5OX0.testsig"
@@ -203,6 +259,9 @@ func TestReadCodexCredential(t *testing.T) {
 		run  func(t *testing.T)
 	}{
 		{"happy path", func(t *testing.T) {
+			// Codex Credential.ExpiresAt is always 0 — even with a valid id_token
+			// present, parseCodexCredFull does not derive expiry (the refresh gate
+			// reads the access-token JWT exp on demand in codex.StoredExpiresAt).
 			body := `{"tokens":{"access_token":"tok","refresh_token":"ref","id_token":"` + testIDToken + `"}}`
 			writeAuth(t, body)
 			cred, err := ReadCodexCredential(context.Background())
@@ -213,19 +272,19 @@ func TestReadCodexCredential(t *testing.T) {
 			if cred.RefreshToken != "ref" {
 				t.Errorf("RefreshToken = %q, want ref", cred.RefreshToken)
 			}
-			if cred.ExpiresAt != 9999999999000 {
-				t.Errorf("ExpiresAt = %d, want 9999999999000", cred.ExpiresAt)
+			if cred.ExpiresAt != 0 {
+				t.Errorf("ExpiresAt = %d, want 0 (codex never derives ExpiresAt)", cred.ExpiresAt)
 			}
 			if len(cred.Raw) == 0 {
 				t.Error("Raw should be non-empty")
 			}
 		}},
-		{"no id token", func(t *testing.T) {
+		{"no id token still zero expiry", func(t *testing.T) {
 			writeAuth(t, `{"tokens":{"access_token":"tok","refresh_token":"ref"}}`)
 			cred, err := ReadCodexCredential(context.Background())
 			testutil.WantNoErr(t, err)
 			if cred.ExpiresAt != 0 {
-				t.Errorf("ExpiresAt = %d, want 0 when id_token absent", cred.ExpiresAt)
+				t.Errorf("ExpiresAt = %d, want 0", cred.ExpiresAt)
 			}
 			if cred.AccessToken != "tok" {
 				t.Errorf("AccessToken = %q, want tok", cred.AccessToken)
@@ -262,18 +321,6 @@ func TestReadCodexCredential(t *testing.T) {
 			testutil.WantNoErr(t, err)
 			if !bytes.Equal(cred.Raw, []byte(body)) {
 				t.Errorf("Raw = %q, want %q", cred.Raw, body)
-			}
-		}},
-		{"malformed id token sets expires at zero", func(t *testing.T) {
-			// D4: malformed-but-present id_token sets ExpiresAt=0 without error.
-			writeAuth(t, `{"tokens":{"access_token":"tok","id_token":"not.a.valid.jwt.at.all"}}`)
-			cred, err := ReadCodexCredential(context.Background())
-			testutil.WantNoErr(t, err)
-			if cred.ExpiresAt != 0 {
-				t.Errorf("ExpiresAt = %d, want 0 for malformed id_token", cred.ExpiresAt)
-			}
-			if cred.AccessToken != "tok" {
-				t.Errorf("AccessToken = %q, want tok", cred.AccessToken)
 			}
 		}},
 		{"api key mode fails", func(t *testing.T) {

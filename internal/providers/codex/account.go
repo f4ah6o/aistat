@@ -13,7 +13,6 @@ type rawCodexTokens struct {
 	Tokens struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
-		IDToken      string `json:"id_token"`
 	} `json:"tokens"`
 }
 
@@ -43,16 +42,15 @@ func StoredRefreshToken(a accounts.Account) string {
 }
 
 // StoredExpiresAt returns the access-token expiry as milliseconds since epoch,
-// derived from the exp claim of tokens.id_token in a.RawBlob.
-// Returns 0 if id_token is absent, the JWT is malformed, or exp is absent.
+// decoded from the exp claim of tokens.access_token in a.RawBlob. Returns 0 if
+// the access token is absent or not a JWT carrying an exp claim — in which case
+// the caller performs no proactive refresh and relies on the usage call (an
+// expired-but-opaque token surfaces via the usage endpoint's 401, which maps to
+// an actionable `codex login` hint). The OIDC id_token is short-lived and is
+// NOT used here — it is identity-only (sub/email); see reconcile.go.
 func StoredExpiresAt(a accounts.Account) int64 {
-	idTok := parseStoredRaw(a).Tokens.IDToken
-	if idTok == "" {
-		return 0
+	if expSec, ok := cred.ParseJWTExp(StoredAccessToken(a)); ok {
+		return expSec * 1000
 	}
-	_, _, expSec, err := cred.ParseCodexIDToken(idTok)
-	if err != nil {
-		return 0
-	}
-	return expSec * 1000
+	return 0
 }

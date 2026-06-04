@@ -55,15 +55,25 @@ func TestStoredRefreshToken(t *testing.T) {
 }
 
 func TestStoredExpiresAt(t *testing.T) {
+	// blob builds a Codex auth.json with the given access_token (raw string).
+	blob := func(accessToken string) []byte {
+		return []byte(`{"tokens":{"access_token":"` + accessToken + `","refresh_token":"ref"}}`)
+	}
 	tests := []struct {
 		name    string
 		account accounts.Account
 		want    int64
 	}{
-		// The fixture's id_token has exp=9999999999; ExpiresAt = exp*1000.
-		{"present", accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}, 9999999999000},
-		{"no id_token", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","refresh_token":"ref"}}`)}, 0},
-		{"malformed id_token", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"tok","id_token":"bad"}}`)}, 0},
+		// Expiry is decoded from the access_token JWT's exp claim, not the id_token.
+		{"access token jwt far future", accounts.Account{RawBlob: blob(accessJWT("tok", 9999999999))}, 9999999999000},
+		// Past exp still yields a positive value (>0) so the gate still fires for
+		// genuine expiry — the guard against silently disabling refresh.
+		{"access token jwt past exp", accounts.Account{RawBlob: blob(accessJWT("tok", 1000000000))}, 1000000000000},
+		{"access token opaque non-jwt", accounts.Account{RawBlob: loadFixtureBytes(t, "auth.json")}, 0},
+		{"access token absent", accounts.Account{RawBlob: []byte(`{"tokens":{"refresh_token":"ref"}}`)}, 0},
+		// id_token carries an exp but access_token is opaque → 0: proves the
+		// id_token is no longer consulted (direct regression guard for the bug).
+		{"id token has exp but access opaque", accounts.Account{RawBlob: []byte(`{"tokens":{"access_token":"opaque","id_token":"` + syntheticIDToken("s", "e@x.com", 9999999999) + `"}}`)}, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

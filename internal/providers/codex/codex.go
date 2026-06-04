@@ -219,12 +219,15 @@ func (w window) toLimit(now time.Time) (providers.Limit, bool) {
 	}, true
 }
 
-// rotateRawBlob returns a copy of rawBlob with tokens.access_token,
-// tokens.refresh_token, and tokens.id_token updated from tok. When
-// tok.IDToken is empty (refresh response omitted id_token), the id_token
-// key is deleted so StoredExpiresAt returns 0 — preventing repeated refresh
-// triggers on a stale near-expiry claim in the old id_token. Unknown fields
-// at all levels survive the round-trip.
+// rotateRawBlob returns a copy of rawBlob with tokens.access_token and
+// tokens.refresh_token updated from tok. tokens.id_token is updated only when
+// the refresh response returned a new one (tok.IDToken != ""); otherwise the
+// existing id_token is left in place. The id_token is identity-only — every
+// consumer (extractIDToken, findActive, ResolveActiveUUID) reads sub/email, not
+// exp, and sub is stable across a refresh, so a preserved (expired-but-same-sub)
+// id_token cannot mis-resolve identity. Refresh expiry is read from the rotated
+// access_token JWT by StoredExpiresAt, so a stale id_token no longer affects the
+// gate. Unknown fields at all levels survive the round-trip.
 func rotateRawBlob(rawBlob json.RawMessage, tok Token) (json.RawMessage, error) {
 	var m map[string]any
 	if err := json.Unmarshal(rawBlob, &m); err != nil {
@@ -238,8 +241,6 @@ func rotateRawBlob(rawBlob json.RawMessage, tok Token) (json.RawMessage, error) 
 	tokens["refresh_token"] = tok.RefreshToken
 	if tok.IDToken != "" {
 		tokens["id_token"] = tok.IDToken
-	} else {
-		delete(tokens, "id_token")
 	}
 	m["tokens"] = tokens
 	out, err := json.Marshal(m)

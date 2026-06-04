@@ -27,8 +27,12 @@ var ErrClaudeWriteUnsupported = errors.New("writing Claude live credential is no
 type Credential struct {
 	AccessToken  string
 	RefreshToken string
-	ExpiresAt    int64 // ms since epoch; 0 if absent
-	Raw          []byte
+	// ExpiresAt is ms since epoch; 0 if absent. Claude only — populated from the
+	// claudeAiOauth.expiresAt field. Codex leaves this 0 (its auth.json has no
+	// expiry field); the codex refresh gate decodes the access-token JWT exp on
+	// demand in codex.StoredExpiresAt.
+	ExpiresAt int64
+	Raw       []byte
 }
 
 // parseClaudeCredFull parses the JSON payload used by both the macOS Keychain

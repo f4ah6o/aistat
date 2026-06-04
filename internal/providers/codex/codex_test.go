@@ -241,10 +241,11 @@ func TestRotateRawBlob(t *testing.T) {
 				t.Errorf("tokens.extra_field = %v, want %q", tokens["extra_field"], "preserve")
 			}
 		}},
-		{"empty id_token clears stale claim", func(t *testing.T) {
-			// Token.IDToken == "" → id_token deleted so StoredExpiresAt returns 0,
-			// preventing repeated refresh triggers on a stale near-expiry claim.
-			original := []byte(`{"tokens":{"access_token":"old-at","refresh_token":"old-rt","id_token":"stale-jwt"}}`)
+		{"empty id_token preserves existing identity claim", func(t *testing.T) {
+			// Token.IDToken == "" (refresh omitted id_token) → the existing id_token
+			// is left in place. It is identity-only (sub stable across refresh);
+			// expiry is read from the rotated access_token, not the id_token.
+			original := []byte(`{"tokens":{"access_token":"old-at","refresh_token":"old-rt","id_token":"existing-jwt"}}`)
 			tok := Token{
 				AccessToken:  "new-at",
 				RefreshToken: "new-rt",
@@ -254,8 +255,20 @@ func TestRotateRawBlob(t *testing.T) {
 			if err != nil {
 				t.Fatalf("rotateRawBlob: %v", err)
 			}
+			if got := extractIDToken(out); got != "existing-jwt" {
+				t.Errorf("id_token = %q, want %q (existing id_token must be preserved)", got, "existing-jwt")
+			}
+		}},
+		{"no id_token in original, none returned, none injected", func(t *testing.T) {
+			// Opaque-token accounts (rawCodexBlob with exp 0) have no id_token key.
+			// A refresh that omits id_token must not inject an empty one.
+			original := []byte(`{"tokens":{"access_token":"old-at","refresh_token":"old-rt"}}`)
+			out, err := rotateRawBlob(original, Token{AccessToken: "new-at", RefreshToken: "new-rt", IDToken: ""})
+			if err != nil {
+				t.Fatalf("rotateRawBlob: %v", err)
+			}
 			if got := extractIDToken(out); got != "" {
-				t.Errorf("id_token = %q, want \"\" (stale id_token must be cleared)", got)
+				t.Errorf("id_token = %q, want \"\" (none must be injected)", got)
 			}
 		}},
 		{"malformed JSON errors", func(t *testing.T) {
@@ -887,15 +900,20 @@ func TestFetch_token_rotation(t *testing.T) {
 		{"rotated tokens persisted to store", func(t *testing.T) {
 			frozen := testNow
 			nearExpirySec := frozen.Add(10 * time.Second).Unix()
+			farFutureSec := frozen.Add(time.Hour).Unix()
 
-			// Live credential carries the near-expiry id_token; reconcile byte-matches
-			// and propagates the live blob (with id_token) to the stored slot, ensuring
-			// StoredExpiresAt returns the near-expiry value and refresh is triggered.
+			// Live credential carries a near-expiry access_token; reconcile byte-matches
+			// and propagates the live blob to the stored slot, so StoredExpiresAt returns
+			// the near-expiry value (from the access_token JWT) and refresh is triggered.
 			live := makeCodexCred("tok-a", "ref-a", nearExpirySec)
 			acct := makeCodexAccount("uuid-a", "alice@example.com", "tok-a", "ref-a", nearExpirySec)
 			store := testutil.MemStore(t, acct)
 
-			refreshSrv := testutil.NewStubServer(t, refreshSuccessBody("tok-a-new", "ref-a-new"), 200, nil)
+			// Refresh returns a realistic far-future access_token JWT (the production
+			// shape); refreshSuccessBody omits id_token, so rotateRawBlob preserves
+			// the existing one (verified below).
+			rotatedAT := accessJWT("tok-a-new", farFutureSec)
+			refreshSrv := testutil.NewStubServer(t, refreshSuccessBody(rotatedAT, "ref-a-new"), 200, nil)
 			usageSrv := testutil.NewStubServer(t, minUsageBody, 200, nil)
 
 			c := buildClient(t, usageSrv, refreshSrv, live, store, noLookupCall(t), nil,
@@ -912,11 +930,16 @@ func TestFetch_token_rotation(t *testing.T) {
 			if len(storedAccts) != 1 {
 				t.Fatalf("store has %d accounts, want 1", len(storedAccts))
 			}
-			if got := StoredAccessToken(storedAccts[0]); got != "tok-a-new" {
-				t.Errorf("stored access_token = %q, want %q", got, "tok-a-new")
+			if got := StoredAccessToken(storedAccts[0]); got != rotatedAT {
+				t.Errorf("stored access_token = %q, want %q", got, rotatedAT)
 			}
 			if got := StoredRefreshToken(storedAccts[0]); got != "ref-a-new" {
 				t.Errorf("stored refresh_token = %q, want %q", got, "ref-a-new")
+			}
+			// The refresh response omitted id_token, so the pre-refresh identity
+			// token must be preserved in the stored blob (rotateRawBlob behavior).
+			if got := extractIDToken(storedAccts[0].RawBlob); got == "" {
+				t.Error("id_token should be preserved in stored blob after a refresh that omits one")
 			}
 		}},
 		{"reconcile upsert before usage fetches", func(t *testing.T) {
@@ -980,7 +1003,11 @@ func TestFetch_token_rotation(t *testing.T) {
 			acct := makeCodexAccount("uuid-a", "alice@example.com", "tok-a", "ref-a", nearExpirySec)
 			store := testutil.MemStore(t, acct)
 
-			refreshSrv, refreshCount := testutil.CountingServer(t, 200, refreshSuccessBody("tok-a-new", "ref-a-new"))
+			// Refresh returns a far-future access_token JWT so the post-rotation
+			// StoredExpiresAt is far future (> now+skew) — the real production path
+			// for "freshly-refreshed token is not re-refreshed", not an opaque→0 fallback.
+			farFutureSec := frozen.Add(time.Hour).Unix()
+			refreshSrv, refreshCount := testutil.CountingServer(t, 200, refreshSuccessBody(accessJWT("tok-a-new", farFutureSec), "ref-a-new"))
 			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
 
 			c := buildClient(t, usageSrv, refreshSrv, nil, store, noLookupCall(t), nil,
@@ -996,16 +1023,47 @@ func TestFetch_token_rotation(t *testing.T) {
 				t.Fatalf("expected 1 refresh call on first Fetch, got %d", refreshCount.Load())
 			}
 
-			// Second Fetch: rotated token has no id_token (cleared by rotateRawBlob when
-			// refresh response omits it), so StoredExpiresAt=0 → no refresh; UUID-keyed
-			// cache still holds the entry → no usage HTTP call.
+			// Second Fetch: rotated access_token is a fresh far-future JWT →
+			// StoredExpiresAt > now+skew → gate false → no refresh; UUID-keyed cache
+			// still holds the entry → no usage HTTP call.
 			_, err = c.Fetch(context.Background())
 			testutil.WantNoErr(t, err)
 			if usageCount.Load() != 1 {
 				t.Errorf("expected cache hit on second Fetch (UUID-keyed), got %d total usage calls", usageCount.Load())
 			}
 			if refreshCount.Load() != 1 {
-				t.Errorf("expected no second refresh (id_token cleared → StoredExpiresAt=0), got %d total refresh calls", refreshCount.Load())
+				t.Errorf("expected no second refresh (fresh far-future access_token JWT), got %d total refresh calls", refreshCount.Load())
+			}
+		}},
+		{"valid access token with expired id token does not refresh", func(t *testing.T) {
+			// Regression for the reported bug: access_token valid for an hour but the
+			// OIDC id_token expired an hour ago. The gate must read the access_token
+			// exp (valid) and NOT refresh — the usage call uses the valid token.
+			frozen := testNow
+			farFutureSec := frozen.Add(time.Hour).Unix()
+			pastSec := frozen.Add(-time.Hour).Unix()
+			at := accessJWT("tok-a", farFutureSec)
+			blob := json.RawMessage(`{"tokens":{"access_token":"` + at + `","refresh_token":"ref-a","id_token":"` +
+				syntheticIDToken("sub-tok-a", "alice@example.com", pastSec) + `"}}`)
+			acct := accounts.Account{UUID: "uuid-a", Email: "alice@example.com", RawBlob: blob}
+			live := &cred.Credential{AccessToken: at, RefreshToken: "ref-a", Raw: []byte(blob)}
+			store := testutil.MemStore(t, acct)
+
+			usageSrv, usageCount := testutil.CountingServer(t, 200, minUsageBody)
+			// RejectServer fails the test if the refresh endpoint is hit at all.
+			c := buildClient(t, usageSrv, testutil.RejectServer(t, "refresh"), live, store, noLookupCall(t), nil,
+				func() time.Time { return frozen })
+
+			out, err := c.Fetch(context.Background())
+			testutil.WantNoErr(t, err)
+			if usageCount.Load() != 1 {
+				t.Errorf("expected exactly 1 usage call, got %d", usageCount.Load())
+			}
+			if len(out.Accounts) != 1 {
+				t.Fatalf("expected 1 account, got %d", len(out.Accounts))
+			}
+			if out.Accounts[0].Error != "" {
+				t.Errorf("account error = %q, want empty (no refresh, valid token)", out.Accounts[0].Error)
 			}
 		}},
 	}

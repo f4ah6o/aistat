@@ -64,19 +64,47 @@ func ParseCodexIDToken(idToken string) (sub, email string, expSec int64, err err
 	return claims.Sub, claims.Email, int64(claims.Exp), nil
 }
 
+// ParseJWTExp decodes the exp claim (seconds since epoch) from a JWT payload
+// without verifying the signature — same posture as ParseCodexIDToken (the Codex
+// CLI already accepted the token). Returns (0, false) when token is not a
+// parseable 3-segment JWT or the exp claim is absent/zero. Used by
+// codex.StoredExpiresAt to read the access-token expiry that drives the refresh
+// gate.
+func ParseJWTExp(token string) (expSec int64, ok bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return 0, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return 0, false
+	}
+	var claims struct {
+		Exp float64 `json:"exp"` // JSON number; may be integer or float
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return 0, false
+	}
+	if claims.Exp <= 0 {
+		return 0, false
+	}
+	return int64(claims.Exp), true
+}
+
 // rawCodexAuth is the minimal shape of ~/.codex/auth.json for credential extraction.
 type rawCodexAuth struct {
 	Tokens struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
-		IDToken      string `json:"id_token"`
 	} `json:"tokens"`
 }
 
 // parseCodexCredFull parses the JSON payload of ~/.codex/auth.json.
 // access_token is required; its absence returns ErrCodexTokenNotFound.
-// id_token is optional: if absent or malformed, ExpiresAt is 0.
-// Raw is set to bytes.Clone(data) so the caller's buffer can be reused.
+// Credential.ExpiresAt is always 0 for codex (auth.json has no expiry field);
+// the refresh gate decodes the access-token JWT exp on demand in
+// codex.StoredExpiresAt. Raw is set to bytes.Clone(data) so the caller's buffer
+// can be reused.
 func parseCodexCredFull(data []byte) (Credential, error) {
 	var raw rawCodexAuth
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -86,20 +114,9 @@ func parseCodexCredFull(data []byte) (Credential, error) {
 		return Credential{}, ErrCodexTokenNotFound
 	}
 
-	var expiresAt int64
-	if raw.Tokens.IDToken != "" {
-		if _, _, expSec, err := ParseCodexIDToken(raw.Tokens.IDToken); err == nil {
-			expiresAt = expSec * 1000
-		}
-		// malformed id_token → ExpiresAt stays 0; not an error for ReadCodexCredential.
-		// T3 reconcile calls ParseCodexIDToken independently on the live credential
-		// to extract sub/email for identity; it will surface the error there if needed.
-	}
-
 	return Credential{
 		AccessToken:  raw.Tokens.AccessToken,
 		RefreshToken: raw.Tokens.RefreshToken,
-		ExpiresAt:    expiresAt,
 		Raw:          bytes.Clone(data),
 	}, nil
 }

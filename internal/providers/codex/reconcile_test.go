@@ -15,56 +15,62 @@ import (
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 
-// syntheticIDToken builds a signature-free JWT whose payload is
-// {"sub":<sub>,"email":<email>,"exp":<expSec>}. The third segment is a
-// placeholder so ParseCodexIDToken's 3-segment check passes.
-func syntheticIDToken(sub, email string, expSec int64) string {
+// jwtFromClaims builds a signature-free 3-segment JWT (header.payload.testsig)
+// for the given claims. The fixed third segment satisfies the 3-non-empty-segment
+// check in both cred.ParseCodexIDToken and cred.ParseJWTExp.
+func jwtFromClaims(claims map[string]any) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
-	payload, _ := json.Marshal(map[string]any{
-		"sub":   sub,
-		"email": email,
-		"exp":   expSec,
-	})
-	payloadEnc := base64.RawURLEncoding.EncodeToString(payload)
-	return header + "." + payloadEnc + ".testsig"
+	payload, _ := json.Marshal(claims)
+	return header + "." + base64.RawURLEncoding.EncodeToString(payload) + ".testsig"
 }
 
-// rawCodexBlob builds a minimal valid Codex auth.json blob. expiresAtSec==0
-// omits the id_token field entirely.
+// syntheticIDToken builds a signature-free identity JWT whose payload is
+// {"sub":<sub>,"email":<email>,"exp":<expSec>}.
+func syntheticIDToken(sub, email string, expSec int64) string {
+	return jwtFromClaims(map[string]any{"sub": sub, "email": email, "exp": expSec})
+}
+
+// accessJWT builds a synthetic access_token JWT carrying exp — the production
+// expiry source read by StoredExpiresAt (cred.ParseJWTExp). sub is derived from
+// accessToken so the string is deterministic (same (accessToken, expSec) ⇒
+// identical bytes, preserving reconcile byte-match) and distinct per account.
+func accessJWT(accessToken string, expSec int64) string {
+	return jwtFromClaims(map[string]any{"sub": "sub-" + accessToken, "exp": expSec})
+}
+
+// rawCodexBlob builds a minimal valid Codex auth.json blob. When expiresAtSec==0
+// the access_token is the bare accessToken string and no id_token is emitted
+// (StoredExpiresAt → 0, no proactive refresh). When expiresAtSec!=0 the exp rides
+// a synthetic access_token JWT (the production expiry source), and a sub-bearing
+// id_token is emitted for reconcile's identity/lookup path.
 func rawCodexBlob(accessToken, refreshToken string, expiresAtSec int64) json.RawMessage {
-	// Derive a deterministic sub from the access token for test simplicity.
 	sub := "sub-" + accessToken
-	tokens := map[string]any{
-		"access_token":  accessToken,
-		"refresh_token": refreshToken,
-	}
+	at := accessToken
+	tokens := map[string]any{"refresh_token": refreshToken}
 	if expiresAtSec != 0 {
+		at = accessJWT(accessToken, expiresAtSec)
 		tokens["id_token"] = syntheticIDToken(sub, sub+"@example.com", expiresAtSec)
 	}
-	b, _ := json.Marshal(map[string]any{
-		"tokens": tokens,
-	})
+	tokens["access_token"] = at
+	b, _ := json.Marshal(map[string]any{"tokens": tokens})
 	return json.RawMessage(b)
 }
 
-// makeCodexCred wraps rawCodexBlob in a cred.Credential.
+// makeCodexCred wraps rawCodexBlob in a cred.Credential. AccessToken is read back
+// from the blob so it equals StoredAccessToken (bare for exp 0, the JWT for
+// exp!=0) — keeping reconcile byte-match consistent. ExpiresAt is always 0 for
+// codex (production no longer derives it; see cred.parseCodexCredFull).
 func makeCodexCred(accessToken, refreshToken string, expiresAtSec int64) *cred.Credential {
 	raw := rawCodexBlob(accessToken, refreshToken, expiresAtSec)
 	var r struct {
 		Tokens struct {
-			IDToken string `json:"id_token"`
+			AccessToken string `json:"access_token"`
 		} `json:"tokens"`
 	}
 	_ = json.Unmarshal(raw, &r)
-	var expiresAt int64
-	if r.Tokens.IDToken != "" {
-		_, _, expSec, _ := cred.ParseCodexIDToken(r.Tokens.IDToken)
-		expiresAt = expSec * 1000
-	}
 	return &cred.Credential{
-		AccessToken:  accessToken,
+		AccessToken:  r.Tokens.AccessToken,
 		RefreshToken: refreshToken,
-		ExpiresAt:    expiresAt,
 		Raw:          []byte(raw),
 	}
 }
@@ -144,11 +150,12 @@ func TestReconcile(t *testing.T) {
 			}
 		}},
 		{"byte match stale refresh token", func(t *testing.T) {
-			// same AT, different RT/id_token in live → RawBlob updated, LastSeenAt stamped.
+			// Same AT (same accessToken+exp ⇒ byte-identical access_token JWT, so
+			// byte-match holds), different RT in live → RawBlob updated, LastSeenAt stamped.
 			stored := []accounts.Account{
 				makeCodexAccount("uuid-0", "user0@example.com", "tok-a", "ref-a-old", 1000),
 			}
-			live := makeCodexCred("tok-a", "ref-a-new", 9999)
+			live := makeCodexCred("tok-a", "ref-a-new", 1000)
 
 			out := Reconcile(ReconcileInput{
 				LiveBlob: live,
