@@ -2,13 +2,10 @@ package copilot
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/drogers0/aistat/v2/internal/cred"
@@ -17,52 +14,57 @@ import (
 )
 
 const (
-	userEndpoint      = "https://api.github.com/user"
-	usageEndpointTmpl = "https://api.github.com/users/%s/settings/billing/premium_request/usage?year=%d&month=%d"
-	acceptHeader      = "application/vnd.github+json"
-	timeout           = 10 * time.Second
-	credTimeout       = 10 * time.Second
-)
+	// copilotUserEndpoint is the Copilot editor/CLI "user" endpoint. It returns
+	// the live quota snapshot GitHub computes for the authenticated user — the
+	// same numbers the web meter and the official Copilot clients show.
+	//
+	// We deliberately read this UNDOCUMENTED internal endpoint instead of the
+	// documented billing endpoint
+	// (https://api.github.com/users/{login}/settings/billing/ai_credit/usage):
+	// the billing endpoint reports only consumed/discount/net credit quantities,
+	// never the included monthly allotment, so using it would force a hardcoded
+	// per-plan quota table that rots whenever GitHub changes an allotment (and
+	// cannot see promotional uplifts or the max/pro_plus tiers at all).
+	// copilot_internal/user returns the live entitlement, so the percentage is
+	// plan-agnostic and self-maintaining. The tradeoff is that an internal
+	// endpoint may change shape without notice; we fail closed with an
+	// actionable error if it does.
+	//
+	// Verified 2026-06: a plain request (Authorization + Accept only, no
+	// editor/version headers) returns the full snapshot.
+	copilotUserEndpoint = "https://api.github.com/copilot_internal/user"
 
-// planQuota maps GitHub Copilot plan slugs (from /user.plan.name) to their
-// monthly premium-request quotas. Source:
-// https://docs.github.com/en/copilot/get-started/plans.
-//
-// Unknown slugs fail-closed (Fetch returns an error → orchestrator marks
-// the provider failed → exit 1) by explicit design. We intentionally do NOT
-// support an env-var override: silent quota fabrication would lie to
-// scripted consumers about percent-used. When GitHub launches a new plan,
-// users file an issue and we ship an update.
-var planQuota = map[string]int{
-	"free":       50,
-	"pro":        300,
-	"pro_plus":   1500,
-	"business":   300,
-	"enterprise": 1000,
-}
+	acceptHeader = "application/vnd.github+json"
+	timeout      = 10 * time.Second
+	credTimeout  = 10 * time.Second
+
+	// quotaKey is the quota_snapshots entry carrying the AI-credit (formerly
+	// premium-request) allotment. The chat/completions entries are token-billed
+	// and report unlimited, so this is the only metered window.
+	quotaKey = "premium_interactions"
+)
 
 type Client struct {
 	doer      *httpx.Doer
 	readToken func(context.Context) (string, error)
-	userURL   string
-	usageURL  func(login string, year int, month int) string
-	// warn is invoked from the Fetch goroutine; if the caller's closure
-	// touches shared state, the caller is responsible for synchronization.
-	warn  func(string)
-	now   func() time.Time
-	quota map[string]int
+	url       string
+	// warn is invoked from the Fetch goroutine; if the caller's closure touches
+	// shared state, the caller is responsible for synchronization.
+	warn func(string)
+	now  func() time.Time
 }
 
 // Option mutates a Client at construction time.
 type Option func(*Client)
 
-// WithWarn installs a callback for the SKU-drift tripwire only. The unknown-plan
-// path returns an error and never invokes this callback.
+// WithWarn installs a callback for the quota-key-drift tripwire only: it fires
+// solely if GitHub renames the `premium_interactions` quota snapshot out from
+// under us.
 func WithWarn(fn func(string)) Option { return func(c *Client) { c.warn = fn } }
 
-// WithNow overrides the clock-of-record used to compute ResetAfterSeconds
-// and the year/month for the billing URL. Defaults to time.Now. Intended for
-// tests; production callers should not override.
+// WithNow overrides the clock used to compute ResetAfterSeconds from the
+// snapshot's reset timestamp. Defaults to time.Now. Intended for tests;
+// production callers should not override.
 func WithNow(fn func() time.Time) Option { return func(c *Client) { c.now = fn } }
 
 func New(debug io.Writer, userAgent string, opts ...Option) *Client {
@@ -75,12 +77,8 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 			debug,
 		),
 		readToken: cred.ReadGitHubToken,
-		userURL:   userEndpoint,
-		usageURL: func(login string, year int, month int) string {
-			return fmt.Sprintf(usageEndpointTmpl, login, year, month)
-		},
-		now:   time.Now,
-		quota: planQuota,
+		url:       copilotUserEndpoint,
+		now:       time.Now,
 	}
 	for _, o := range opts {
 		o(c)
@@ -90,49 +88,19 @@ func New(debug io.Writer, userAgent string, opts ...Option) *Client {
 
 func (c *Client) ID() string { return "copilot" }
 
-type userResp struct {
-	Login string `json:"login"`
-	Plan  struct {
-		Name string `json:"name"`
-	} `json:"plan"`
+// quotaSnapshot is one entry of copilot_internal/user's quota_snapshots map.
+// has_quota is intentionally not read — it is false even for an account with a
+// positive entitlement, so it is not a usable "has a metered pool" signal; we
+// gate on Unlimited and Entitlement instead.
+type quotaSnapshot struct {
+	Entitlement      float64 `json:"entitlement"`
+	PercentRemaining float64 `json:"percent_remaining"`
+	Unlimited        bool    `json:"unlimited"`
 }
 
-type usageItem struct {
-	Product       string  `json:"product"`
-	SKU           string  `json:"sku"`
-	GrossQuantity float64 `json:"grossQuantity"`
-}
-
-type usageResp struct {
-	UsageItems []usageItem `json:"usageItems"`
-}
-
-// classifyCopilot adds GitHub's missing-scope tripwire on top of DefaultClassify.
-// GitHub returns 404 with `{"message":"Not Found",...}` from the billing
-// endpoint when the token lacks the `user` scope or the account has no Copilot
-// premium-request billing data yet. Install this classifier ONLY on the
-// billing call — the /user call must use DefaultClassify so that a transient
-// 404 from /user (during GitHub outages or endpoint deprecation) is not
-// mis-surfaced.
-//
-// The body is decoded as JSON and the `message` field is matched
-// case-insensitively against known GitHub "not-found" phrasings. A 404 with
-// no JSON body, or with a `message` we don't recognize, falls through to
-// DefaultClassify (surfaces as bare HTTP 404) so we never lie about the
-// cause.
-func classifyCopilot(url string, resp *http.Response, body []byte) error {
-	if resp.StatusCode == 404 {
-		var env struct {
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(body, &env) == nil {
-			m := strings.ToLower(strings.TrimSpace(env.Message))
-			if m == "not found" || m == "resource not found" {
-				return fmt.Errorf("%w: %s", providers.ErrAuthMissing, cred.GitHubTokenMissingMessage)
-			}
-		}
-	}
-	return httpx.DefaultClassify(url, resp, body)
+type copilotUserResp struct {
+	QuotaResetDateUTC time.Time                `json:"quota_reset_date_utc"`
+	QuotaSnapshots    map[string]quotaSnapshot `json:"quota_snapshots"`
 }
 
 func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
@@ -141,75 +109,39 @@ func (c *Client) Fetch(ctx context.Context) (providers.ProviderOutput, error) {
 		return providers.ProviderOutput{}, err
 	}
 
-	// Each HTTP call gets its own 10s budget via GetJSON's timeout parameter
-	// (parity with Claude and Codex single-call providers).
-	var user userResp
-	if err := c.doer.GetJSON(ctx, c.userURL, token, timeout, &user, httpx.DefaultClassify); err != nil {
+	// Auth/permission failures classify via DefaultClassify (401/403 →
+	// ErrAuthDenied). A bare 404 is intentionally NOT remapped to "missing
+	// scope": that would mislabel a transient outage or an endpoint
+	// deprecation, so it surfaces as a plain HTTP 404 instead.
+	var resp copilotUserResp
+	if err := c.doer.GetJSON(ctx, c.url, token, timeout, &resp, httpx.DefaultClassify); err != nil {
 		return providers.ProviderOutput{}, err
 	}
-	if user.Login == "" {
-		return providers.ProviderOutput{}, errors.New("github /user returned empty login")
-	}
 
-	quota, ok := c.quota[user.Plan.Name]
+	pool, ok := resp.QuotaSnapshots[quotaKey]
 	if !ok {
-		// Bare error (no sentinel) is intentional: no current consumer would branch on
-		// a contract-drift sentinel. Add one if a real use case appears.
-		return providers.ProviderOutput{}, fmt.Errorf(
-			"copilot plan %q is not in the known quota table; please file an issue at %s with your plan name (from /user.plan.name)",
-			user.Plan.Name, providers.IssueTrackerURL,
-		)
-	}
-	if quota <= 0 {
-		return providers.ProviderOutput{}, fmt.Errorf(
-			"copilot plan %q has zero quota in the known-quota table; this is a code bug, please file an issue at %s",
-			user.Plan.Name, providers.IssueTrackerURL,
-		)
-	}
-
-	// Two `now` captures: urlNow (pre-billing) drives the URL's year/month
-	// (queries the just-completed billing period). subNow (post-billing)
-	// drives the reset-month math so the reset always reflects the wall clock
-	// AFTER the billing call returned — prevents a Jan 31 23:59:55 → Feb 1
-	// 00:00:05 call from computing reset = Feb 1 (in the past) using urlNow's
-	// January.
-	urlNow := c.now().UTC().Truncate(time.Second)
-
-	var usage usageResp
-	if err := c.doer.GetJSON(ctx, c.usageURL(user.Login, urlNow.Year(), int(urlNow.Month())), token, timeout, &usage, classifyCopilot); err != nil {
-		return providers.ProviderOutput{}, err
-	}
-	subNow := c.now().UTC().Truncate(time.Second)
-
-	var gross float64
-	var copilotProductItems int
-	var sawPremiumSku bool
-	for _, it := range usage.UsageItems {
-		if it.Product == "Copilot" {
-			copilotProductItems++
-			if it.SKU == "Copilot Premium Request" {
-				sawPremiumSku = true
-				gross += it.GrossQuantity
-			}
+		// Quota-key-drift tripwire: snapshots are present but the metered key is
+		// gone → GitHub likely renamed it. Warn and report no window rather than
+		// silently emitting a misleading 0%.
+		if len(resp.QuotaSnapshots) > 0 && c.warn != nil {
+			c.warn(fmt.Sprintf("copilot: quota_snapshots present but %q key missing — GitHub may have renamed the quota; please file an issue at %s", quotaKey, providers.IssueTrackerURL))
 		}
+		return providers.ProviderOutput{Limits: map[string]providers.Limit{}}, nil
 	}
-	// Silent-degradation tripwire: Copilot-product items present but no
-	// premium-request SKU ever observed → GitHub probably renamed the SKU.
-	// Keep emitting 0% (a brand-new account with no premium usage produces
-	// the same result), but warn the user that the result may be suspect.
-	if copilotProductItems > 0 && !sawPremiumSku && c.warn != nil {
-		c.warn(`copilot: Copilot-product usageItems present but none matched sku="Copilot Premium Request" — GitHub may have renamed the SKU; please file an issue at ` + providers.IssueTrackerURL)
-	}
-	// Clamp to 100: the Limit contract uses a [0,100] convention. Overage
-	// detail lives in the API's discountQuantity/netQuantity fields but is
-	// out of scope for this contract. Float artifacts from the division
-	// (e.g. 67.33999999999999) are smoothed at the JSON boundary by
-	// Limit.MarshalJSON; raw values stay in the struct.
-	used := math.Min(100, (gross/float64(quota))*100)
 
-	year, month, _ := subNow.Date()
-	reset := time.Date(year, month+1, 1, 0, 0, 0, 0, time.UTC) // month=13 → Jan next year (Go normalizes).
-	secs := int(reset.Sub(subNow).Seconds())
+	// No metered credit pool (an unlimited grant, or no allotment) → N/A,
+	// reported as a non-nil empty map so the renderer suppresses the section.
+	if pool.Unlimited || pool.Entitlement <= 0 {
+		return providers.ProviderOutput{Limits: map[string]providers.Limit{}}, nil
+	}
+
+	// percent_remaining is GitHub's own meter value, already clamped at 0 on
+	// overage; mirror that clamp into used.
+	used := math.Min(100, math.Max(0, 100-pool.PercentRemaining))
+
+	now := c.now().UTC().Truncate(time.Second)
+	reset := resp.QuotaResetDateUTC.UTC()
+	secs := int(reset.Sub(now).Seconds())
 	if secs < 0 {
 		secs = 0
 	}

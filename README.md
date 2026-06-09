@@ -159,7 +159,7 @@ Auto-pick buckets candidates by 5% (so 87% and 89% are equivalent) and breaks ti
 |----------|-----------|
 | Claude   | `api.anthropic.com/api/oauth/usage`, `api.anthropic.com/api/oauth/profile`, `platform.claude.com/v1/oauth/token` |
 | Codex    | `chatgpt.com/backend-api/wham/usage` |
-| Copilot  | `api.github.com/users/{login}/settings/billing/premium_request/usage` |
+| Copilot  | `api.github.com/copilot_internal/user` |
 
 **Caching.** Each Claude account's usage response is cached for 90 seconds so back-to-back invocations don't hammer Anthropic's rate limit. `aistat usage --refresh` bypasses the cache; `aistat switch` reads through it, so refresh first if you want a switch decision based on the freshest numbers. Override the TTL with `AISTAT_USAGE_CACHE_TTL=10s` (or any duration). If the cache can't be written, the run proceeds without it.
 
@@ -179,9 +179,9 @@ Auto-pick buckets candidates by 5% (so 87% and 89% are equivalent) and breaks ti
 **Diagnostics on stderr.** Even without `--debug`, providers may emit diagnostic lines to stderr. All start with `aistat:`.
 
 ```
-aistat: copilot: Copilot-product usageItems present but none matched
-  sku="Copilot Premium Request" — GitHub may have renamed the SKU; please
-  file an issue at https://github.com/drogers0/aistat/issues
+aistat: copilot: quota_snapshots present but "premium_interactions" key missing —
+  GitHub may have renamed the quota; please file an issue at
+  https://github.com/drogers0/aistat/issues
 
 aistat: claude: could not capture live account profile (<reason>); rendering live row
   without storing — run `claude /login` if this persists across runs

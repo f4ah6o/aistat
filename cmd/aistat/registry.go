@@ -56,7 +56,7 @@ func realProviders(serialStderr *httpx.ConcurrencySafeWriter, includeDebug bool,
 
 // wrapWarn returns the warn callback wired into copilot.New. Every line the
 // provider emits is prefixed with "aistat: " so the source is obvious
-// when --debug is OFF and only the SKU-drift line surfaces. Extracted from
+// when --debug is OFF and only the quota-key-drift line surfaces. Extracted from
 // realProviders so the prefix contract is unit-testable without HTTP.
 func wrapWarn(out io.Writer) func(string) {
 	return func(s string) { fmt.Fprintln(out, "aistat: "+s) }

@@ -8,7 +8,7 @@ import (
 )
 
 // DefaultUserAgent returns the User-Agent for Copilot requests. Today this is
-// the honest aistat UA — there is no evidence the GitHub Copilot billing
+// the honest aistat UA — there is no evidence the copilot_internal/user
 // endpoint partitions rate-limits by UA. The seam exists so the default can be
 // tuned if that changes (mirrors claude.DefaultUserAgent).
 //
