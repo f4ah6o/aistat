@@ -104,6 +104,64 @@ func makeLimits(fiveHourRemaining float64) map[string]providers.Limit {
 	}
 }
 
+// makeLimitsFull builds a Limit map from explicit per-window remaining
+// percentages. A window absent from the map is omitted, mirroring how providers
+// drop untouched/inapplicable windows. Only RemainingPercent (and its UsedPercent
+// complement) is set — the auto-pick comparator reads nothing else.
+func makeLimitsFull(remaining map[string]float64) map[string]providers.Limit {
+	out := map[string]providers.Limit{}
+	for k, r := range remaining {
+		out[k] = providers.Limit{RemainingPercent: r, UsedPercent: 100 - r}
+	}
+	return out
+}
+
+func TestScoreAccount(t *testing.T) {
+	seen := time.Now()
+	tests := []struct {
+		name      string
+		limits    map[string]float64
+		exhausted bool
+		immediate int
+		sustained int
+	}{
+		{"absent five_hour is full immediate", map[string]float64{"seven_day": 50}, false, 20, 10},
+		{"present five_hour buckets", map[string]float64{"five_hour": 60, "seven_day": 90}, false, 12, 18},
+		{"empty limits is a fresh full account", map[string]float64{}, false, 20, 20},
+		{"exhausted just below boundary", map[string]float64{"seven_day": 0.999}, true, 20, 0},
+		{"usable exactly at boundary", map[string]float64{"seven_day": 1.0}, false, 20, 0},
+		{"sustained takes min across long windows", map[string]float64{"five_hour": 100, "seven_day": 80, "thirty_day": 5}, false, 20, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := scoreAccount(makeLimitsFull(tt.limits), seen)
+			if s.exhausted != tt.exhausted || s.immediate != tt.immediate || s.sustained != tt.sustained {
+				t.Errorf("scoreAccount = {exhausted:%v immediate:%d sustained:%d}, want {exhausted:%v immediate:%d sustained:%d}",
+					s.exhausted, s.immediate, s.sustained, tt.exhausted, tt.immediate, tt.sustained)
+			}
+		})
+	}
+}
+
+func TestScoreBetter(t *testing.T) {
+	now := time.Now()
+	usable := scoreAccount(makeLimitsFull(map[string]float64{"five_hour": 30, "seven_day": 50}), now)
+	spent := scoreAccount(makeLimitsFull(map[string]float64{"five_hour": 100, "seven_day": 0}), now)
+	if !usable.better(spent) {
+		t.Error("non-exhausted account must beat an exhausted one regardless of 5h headroom")
+	}
+	if spent.better(usable) {
+		t.Error("exhausted account must not beat a usable one")
+	}
+
+	// Equal exhaustion + immediate bucket → more weekly runway wins.
+	hi := scoreAccount(makeLimitsFull(map[string]float64{"five_hour": 60, "seven_day": 90}), now)
+	lo := scoreAccount(makeLimitsFull(map[string]float64{"five_hour": 60, "seven_day": 30}), now.Add(time.Hour))
+	if !hi.better(lo) {
+		t.Error("among same-5h-bucket accounts, more weekly runway must win over a more-recent lastSeen")
+	}
+}
+
 // getAccountFromStore returns the account for uuid from the store, failing the
 // test if it is absent.
 func getAccountFromStore(t *testing.T, ms *accounts.MemoryStore, uuid string) accounts.Account {
@@ -366,6 +424,153 @@ func TestSwitchAutoPick(t *testing.T) {
 			accountB := getAccountFromStore(t, ms, "uuid-b")
 			if !bytes.Equal(*written, []byte(accountB.RawBlob)) {
 				t.Errorf("written blob does not match accountB's RawBlob")
+			}
+		}},
+		{"no five_hour window beats exhausted five_hour active", func(t *testing.T) {
+			// Issue #16: active is exhausted on its 5h window (1% remaining) but
+			// the candidate has no five_hour window at all (untouched ⇒ full
+			// headroom) plus a healthy seven_day. The candidate must be picked.
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
+			seedAccount(t, ms, "uuid-fresh", "fresh@example.com", "default_claude_max_5x", now.Add(-2*time.Hour))
+
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "fresh@example.com", UUID: "uuid-fresh", Limits: makeLimitsFull(map[string]float64{"seven_day": 63})},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimitsFull(map[string]float64{"five_hour": 1, "seven_day": 80}), nil
+			})
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "fresh@example.com")
+			fresh := getAccountFromStore(t, ms, "uuid-fresh")
+			if !bytes.Equal(*written, []byte(fresh.RawBlob)) {
+				t.Errorf("written blob does not match fresh account's RawBlob")
+			}
+		}},
+		{"exhausted long window not picked over usable active", func(t *testing.T) {
+			// Candidate has a fresh 5h window but its seven_day is exhausted (0%);
+			// active is usable on both. The exhaustion gate must keep us put.
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-spent", "spent@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
+
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "spent@example.com", UUID: "uuid-spent", Limits: makeLimitsFull(map[string]float64{"five_hour": 100, "seven_day": 0})},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimitsFull(map[string]float64{"five_hour": 50, "seven_day": 80}), nil
+			})
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on best account (active@example.com)")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called for an exhausted candidate")
+			}
+		}},
+		{"sustained tiebreak prefers more weekly runway", func(t *testing.T) {
+			// Two candidates share the five_hour bucket; the lower-seven_day one is
+			// seeded more-recent so current code's LastSeenAt tiebreak picks it.
+			// New code must instead pick the higher-seven_day candidate.
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-3*time.Hour))
+			seedAccount(t, ms, "uuid-hi", "hi@example.com", "default_claude_max_5x", now.Add(-2*time.Hour))
+			seedAccount(t, ms, "uuid-lo", "lo@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "hi@example.com", UUID: "uuid-hi", Limits: makeLimitsFull(map[string]float64{"five_hour": 60, "seven_day": 90})},
+					{Email: "lo@example.com", UUID: "uuid-lo", Limits: makeLimitsFull(map[string]float64{"five_hour": 60, "seven_day": 30})},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimitsFull(map[string]float64{"five_hour": 10, "seven_day": 80}), nil
+			})
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "hi@example.com")
+			hi := getAccountFromStore(t, ms, "uuid-hi")
+			if !bytes.Equal(*written, []byte(hi.RawBlob)) {
+				t.Errorf("written blob does not match hi account's RawBlob")
+			}
+		}},
+		{"free account exhausted on thirty_day not picked", func(t *testing.T) {
+			// Regression guard (passes on current code): a free account with only
+			// thirty_day at 0% remaining must never be auto-picked.
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-free", "free@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
+
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "free@example.com", UUID: "uuid-free", Limits: makeLimitsFull(map[string]float64{"thirty_day": 0})},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimitsFull(map[string]float64{"five_hour": 40, "seven_day": 70}), nil
+			})
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "already on best account (active@example.com)")
+			if *written != nil {
+				t.Error("writeClaudeLiveBlob should not have been called for an exhausted free account")
+			}
+		}},
+		{"low but not exhausted long window still picked", func(t *testing.T) {
+			// Exhaustion-only policy: a candidate with a fresh 5h and a low-but-not
+			// -exhausted seven_day (7%) is still picked over a half-used active.
+			ms := withMemoryStore(t)
+			withCodexMemoryStore(t)
+			now := time.Now()
+			seedAccount(t, ms, "uuid-active", "active@example.com", "default_claude_max_5x", now.Add(-1*time.Hour))
+			seedAccount(t, ms, "uuid-low", "low@example.com", "default_claude_max_5x", now.Add(-30*time.Minute))
+
+			withSwitchActiveUUID(t, "uuid-active")
+			stub := &stubSwitchClient{
+				fetchResults: []providers.AccountResult{
+					{Email: "low@example.com", UUID: "uuid-low", Limits: makeLimitsFull(map[string]float64{"five_hour": 100, "seven_day": 7})},
+				},
+			}
+			withSwitchClient(t, stub)
+			withFetchLiveUsageFn(t, func(_ string) (map[string]providers.Limit, error) {
+				return makeLimitsFull(map[string]float64{"five_hour": 50, "seven_day": 80}), nil
+			})
+			written, _ := withWriteBlob(t)
+
+			r := runSwitchTest()
+			wantExit(t, r, 0)
+			wantOut(t, r, "low@example.com")
+			low := getAccountFromStore(t, ms, "uuid-low")
+			if !bytes.Equal(*written, []byte(low.RawBlob)) {
+				t.Errorf("written blob does not match low account's RawBlob")
 			}
 		}},
 		{"one failing excluded other wins", func(t *testing.T) {

@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -186,28 +185,83 @@ func handleByID(handles []switchHandle, id string) switchHandle {
 	panic("handleByID: unknown provider " + id) // caller already validated
 }
 
-// fiveHourBucket returns the D13 auto-pick sort bucket for a limits map.
-// bucket = floor(five_hour.RemainingPercent / 5). Returns -1 when five_hour is absent.
-func fiveHourBucket(limits map[string]providers.Limit) int {
-	if limits == nil {
-		return -1
+// Auto-pick ranking constants. The 5% bucket gives hysteresis (no flapping
+// between two close accounts); exhaustedPct gates accounts spent on a sustained
+// window. No reset-time or relief tuning knobs — that policy is deferred to #7.
+const (
+	bucketPct    = 5.0
+	exhaustedPct = 1.0
+)
+
+const shortKey = "five_hour"
+
+// longKeys are the sustained-ceiling windows used by the exhaustion gate and the
+// sustained-headroom tiebreak. Model-specific (seven_day_sonnet) and unknown
+// (window_<N>s, code_review_*) windows are intentionally excluded — they are
+// informational only. longKeys is a superset: Claude emits seven_day, Codex
+// emits seven_day or thirty_day; absent keys are simply skipped.
+var longKeys = []string{"seven_day", "thirty_day"}
+
+// longRemaining is the binding (minimum) RemainingPercent across present long
+// windows, or 100 when none are present (no sustained constraint).
+func longRemaining(l map[string]providers.Limit) float64 {
+	r := 100.0
+	for _, k := range longKeys {
+		if w, ok := l[k]; ok && w.RemainingPercent < r {
+			r = w.RemainingPercent
+		}
 	}
-	win, ok := limits["five_hour"]
-	if !ok {
-		return -1
-	}
-	return int(math.Floor(win.RemainingPercent / 5))
+	return r
 }
 
-// switchBetter reports whether candidate a is preferred over b for D13 auto-pick.
-// Primary sort: fiveHourBucket descending. Tiebreak: lastSeen descending (more recent wins).
-func switchBetter(a providers.AccountResult, aLastSeen time.Time, b providers.AccountResult, bLastSeen time.Time) bool {
-	ba := fiveHourBucket(a.Limits)
-	bb := fiveHourBucket(b.Limits)
-	if ba != bb {
-		return ba > bb
+// score is the lexicographic auto-pick rank for one account. Windows are ordered
+// by operational role, never blended: five_hour is the immediate throttle, the
+// long windows are the sustained ceiling. An account with no windows at all
+// (a successful fetch on a fully-fresh account) scores as full headroom.
+type score struct {
+	exhausted bool // a present long window is at ~0% remaining
+	immediate int  // floor(five_hour remaining / bucketPct); absent five_hour ⇒ full
+	sustained int  // floor(longRemaining / bucketPct)
+	lastSeen  time.Time
+}
+
+// scoreAccount computes the auto-pick rank for an account's limits. int(x/bucketPct)
+// is floor over the non-negative percent domain (no math.Floor needed).
+func scoreAccount(l map[string]providers.Limit, lastSeen time.Time) score {
+	long := longRemaining(l)
+	r := 100.0 // absent five_hour ⇒ untouched / not-applicable ⇒ full immediate headroom
+	if w, ok := l[shortKey]; ok {
+		r = w.RemainingPercent
 	}
-	return aLastSeen.After(bLastSeen)
+	return score{
+		exhausted: long < exhaustedPct,
+		immediate: int(r / bucketPct),
+		sustained: int(long / bucketPct),
+		lastSeen:  lastSeen,
+	}
+}
+
+// better reports whether score a is preferred over b:
+// non-exhausted ▸ more 5h headroom ▸ more weekly runway ▸ most recently active.
+func (a score) better(b score) bool {
+	if a.exhausted != b.exhausted {
+		return !a.exhausted
+	}
+	if a.immediate != b.immediate {
+		return a.immediate > b.immediate
+	}
+	if a.sustained != b.sustained {
+		return a.sustained > b.sustained
+	}
+	return a.lastSeen.After(b.lastSeen)
+}
+
+// lastSeenOf returns a.LastSeenAt, or the zero time when a is nil.
+func lastSeenOf(a *accounts.Account) time.Time {
+	if a == nil {
+		return time.Time{}
+	}
+	return a.LastSeenAt
 }
 
 // findAccountByUUID returns a pointer to the first account in stored whose UUID
@@ -345,21 +399,15 @@ func runSwitchSingle(ctx context.Context, h switchHandle, toArg string, stdout, 
 			return int(orchestrate.StatusUsageError)
 		}
 
-		// Rank candidates by bucketed comparator: bucket desc, LastSeenAt desc within bucket.
+		// Rank candidates: non-exhausted ▸ more 5h headroom ▸ more weekly runway ▸ most recent.
 		best := candidates[0]
 		bestAcct := findAccountByUUID(stored, best.UUID)
+		bestScore := scoreAccount(best.Limits, lastSeenOf(bestAcct))
 		for _, c := range candidates[1:] {
 			cAcct := findAccountByUUID(stored, c.UUID)
-			var cLastSeen, bestLastSeen time.Time
-			if cAcct != nil {
-				cLastSeen = cAcct.LastSeenAt
-			}
-			if bestAcct != nil {
-				bestLastSeen = bestAcct.LastSeenAt
-			}
-			if switchBetter(c, cLastSeen, best, bestLastSeen) {
-				best = c
-				bestAcct = cAcct
+			cScore := scoreAccount(c.Limits, lastSeenOf(cAcct))
+			if cScore.better(bestScore) {
+				best, bestAcct, bestScore = c, cAcct, cScore
 			}
 		}
 
@@ -368,12 +416,7 @@ func runSwitchSingle(ctx context.Context, h switchHandle, toArg string, stdout, 
 		if activeAcct := findAccountByUUID(stored, activeUUID); activeAcct != nil {
 			activeLimits, liveErr := h.fetchLiveUsage(ctx, h.storedAccess(*activeAcct), activeAcct.UUID, h.ua, debugW)
 			if liveErr == nil {
-				activeAR := providers.AccountResult{Limits: activeLimits}
-				var bestLastSeen time.Time
-				if bestAcct != nil {
-					bestLastSeen = bestAcct.LastSeenAt
-				}
-				if !switchBetter(best, bestLastSeen, activeAR, activeAcct.LastSeenAt) {
+				if !bestScore.better(scoreAccount(activeLimits, activeAcct.LastSeenAt)) {
 					fmt.Fprintf(stdout, "already on best account (%s)\n", prevEmail)
 					return 0
 				}
