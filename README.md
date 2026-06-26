@@ -64,9 +64,7 @@ aistat usage copilot
 
 ## Installation
 
-Do not use `curl | sh` for this fork.
-
-Build from a pinned local checkout instead:
+Build from a pinned local checkout:
 
 ```bash
 git clone https://github.com/f4ah6o/aistat.git
@@ -77,7 +75,7 @@ go build -trimpath -o ~/.local/bin/aistat ./cmd/aistat
 ~/.local/bin/aistat --version
 ```
 
-The module path is still the upstream module path, so clone-and-build is the supported install path for this fork. Avoid `go install github.com/f4ah6o/aistat/...@latest` until the module path is intentionally renamed across the repository.
+The module path is `github.com/f4ah6o/aistat/v2`.
 
 ## How it works
 
