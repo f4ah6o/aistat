@@ -8,7 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 
-	"github.com/drogers0/aistat/v2/internal/orchestrate"
+	"github.com/f4ah6o/aistat/v2/internal/orchestrate"
 )
 
 // version is the goreleaser-injected build tag (via `-ldflags "-X main.version=..."`);
