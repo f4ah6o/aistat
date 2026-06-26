@@ -5,3 +5,8 @@
 /.orchestration_reminder.pid
 /.orchestration_safety.pid
 /.claude/
+
+
+# Added by cargo
+
+/target

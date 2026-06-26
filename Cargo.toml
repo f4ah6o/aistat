@@ -1,0 +1,22 @@
+[[bin]]
+name = "agent-usage"
+path = "src/main.rs"
+
+[package]
+name = "agent-usage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+fs2 = "0.4"
+
+[features]
+fake = []
