@@ -5,11 +5,11 @@ import (
 	"errors"
 	"io"
 
-	"github.com/drogers0/aistat/v2/internal/accounts"
-	"github.com/drogers0/aistat/v2/internal/httpx"
-	"github.com/drogers0/aistat/v2/internal/providers"
-	"github.com/drogers0/aistat/v2/internal/providers/claude"
-	"github.com/drogers0/aistat/v2/internal/providers/codex"
+	"github.com/f4ah6o/aistat/v2/internal/accounts"
+	"github.com/f4ah6o/aistat/v2/internal/httpx"
+	"github.com/f4ah6o/aistat/v2/internal/providers"
+	"github.com/f4ah6o/aistat/v2/internal/providers/claude"
+	"github.com/f4ah6o/aistat/v2/internal/providers/codex"
 )
 
 // realProviders constructs the live read-only providers.
