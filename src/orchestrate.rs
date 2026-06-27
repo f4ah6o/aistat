@@ -1,4 +1,4 @@
-use crate::providers::{Provider, ProviderResult, Report};
+use crate::providers::{Provider, ProviderError, ProviderResult, Report};
 use chrono::Utc;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -54,7 +54,13 @@ pub fn run(
                             error: None,
                         },
                         Err(e) => {
-                            *any_failed.lock().unwrap() = true;
+                            // AuthMissing means the provider is not configured; treat
+                            // it as an intentional skip in bulk runs so that users who
+                            // haven't set up OpenCode Go don't get exit code 1 from
+                            // the default `agent-usage usage` command.
+                            if !matches!(e, ProviderError::AuthMissing(_)) {
+                                *any_failed.lock().unwrap() = true;
+                            }
                             ProviderResult {
                                 limits: None,
                                 accounts: vec![],
