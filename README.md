@@ -82,6 +82,11 @@ dist manifest --artifacts=all --output-format=json --no-local-paths
 
 Live provider checks require local credentials and may fail when upstream usage endpoints rate-limit.
 
+## Acknowledgements
+
+- This project originated from [drogers0/aistat](https://github.com/drogers0/aistat).
+- The OpenCode Go usage handling references [opgginc/opencode-bar](https://github.com/opgginc/opencode-bar).
+
 ## License
 
 [MIT](LICENSE)
