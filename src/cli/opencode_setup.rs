@@ -14,7 +14,7 @@ pub struct SetupArgs {
 pub fn run_setup(args: SetupArgs) -> i32 {
     let (workspace_id, auth_cookie) = match (args.workspace_id, args.auth_cookie) {
         (Some(workspace_id), Some(auth_cookie)) => (workspace_id, auth_cookie),
-        (None, None) => match crate::cred::chrome_cookie_darwin::extract_from_chrome() {
+        (None, None) => match extract_from_browser() {
             Some(pair) => pair,
             None => {
                 eprintln!(
@@ -100,4 +100,14 @@ fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     }
 
     f.write_all(data)
+}
+
+#[cfg(target_os = "macos")]
+fn extract_from_browser() -> Option<(String, String)> {
+    crate::cred::chrome_cookie_darwin::extract_from_chrome()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_from_browser() -> Option<(String, String)> {
+    None
 }
