@@ -1,7 +1,10 @@
 pub mod claude;
 pub mod codex;
 pub mod github;
+pub mod opencode;
 
+#[cfg(target_os = "macos")]
+pub mod chrome_cookie_darwin;
 #[cfg(target_os = "macos")]
 pub mod keychain_darwin;
 #[cfg(target_os = "linux")]
@@ -17,6 +20,8 @@ pub enum CredError {
     CodexNotFound,
     #[error("GitHub token not found — run `gh auth login`")]
     GitHubNotFound,
+    #[error("opencode go config not found — set OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE, or run `agent-usage opencodego setup`")]
+    OpenCodeGoNotFound,
     #[error("{0}")]
     Other(String),
 }

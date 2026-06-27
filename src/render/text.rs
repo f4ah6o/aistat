@@ -20,6 +20,11 @@ fn text_labels(provider_id: &str) -> &'static [LabelEntry] {
             LabelEntry { key: "code_review_seven_day", label: "Code review 7-day" },
         ],
         "copilot" => &[LabelEntry { key: "month", label: "month" }],
+        "opencodego" => &[
+            LabelEntry { key: "five_hour", label: "5-hour" },
+            LabelEntry { key: "seven_day", label: "7-day" },
+            LabelEntry { key: "monthly", label: "Monthly" },
+        ],
         _ => &[],
     }
 }

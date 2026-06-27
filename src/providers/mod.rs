@@ -3,6 +3,7 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 pub mod multiaccount;
+pub mod opencode_go;
 pub mod usagecache;
 
 use chrono::{DateTime, Utc};
@@ -12,7 +13,7 @@ use thiserror::Error;
 
 pub const ISO8601_FMT: &str = "%Y-%m-%dT%H:%M:%S%:z";
 
-pub const KNOWN_PROVIDER_IDS: &[&str] = &["claude", "codex"];
+pub const KNOWN_PROVIDER_IDS: &[&str] = &["claude", "codex", "opencodego"];
 
 pub const PROJECT_URL: &str = "https://github.com/f4ah6o/aistat";
 pub const ISSUE_TRACKER_URL: &str = "https://github.com/f4ah6o/aistat/issues";
